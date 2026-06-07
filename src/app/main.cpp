@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commdlg.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 
@@ -16,6 +17,14 @@
 
 #include "resource.h"
 
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 reinterpret_cast<DPI_AWARENESS_CONTEXT>(-4)
+#endif
+
+#ifndef EM_SETCUEBANNER
+#define EM_SETCUEBANNER 0x1501
+#endif
+
 namespace
 {
 constexpr UINT kTrayMessage = WM_APP + 1;
@@ -30,6 +39,8 @@ constexpr UINT kIdAddExe = 2003;
 constexpr UINT kIdClose = 2004;
 constexpr UINT kIdRemoveExe = 2005;
 constexpr UINT kIdRefreshLog = 2006;
+constexpr UINT kIdEntry = 2007;
+constexpr UINT kIdAddEntry = 2008;
 constexpr wchar_t kWindowClass[] = L"FlipConfigBypassTray";
 constexpr wchar_t kEditorClass[] = L"FlipConfigBypassEditor";
 constexpr wchar_t kLogClass[] = L"FlipConfigBypassLog";
@@ -58,6 +69,7 @@ HBRUSH g_fieldBrush = nullptr;
 COLORREF g_textColor = RGB(24, 31, 39);
 COLORREF g_windowColor = RGB(248, 250, 252);
 COLORREF g_fieldColor = RGB(255, 255, 255);
+UINT g_dpi = 96;
 
 HMENU menuId(UINT id)
 {
@@ -66,9 +78,9 @@ HMENU menuId(UINT id)
 
 void initFonts()
 {
-    g_uiFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_uiFont = CreateFontW(-MulDiv(10, static_cast<int>(g_dpi), 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    g_titleFont = CreateFontW(-20, 0, 0, 0, 600, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_titleFont = CreateFontW(-MulDiv(13, static_cast<int>(g_dpi), 72), 0, 0, 0, 600, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 }
 
@@ -84,6 +96,34 @@ HWND createButton(HWND parent, UINT id, const wchar_t* text, DWORD style = 0)
         0, 0, 0, 0, parent, menuId(id), g_instance, nullptr);
     setFont(button);
     return button;
+}
+
+int scale(int value)
+{
+    return MulDiv(value, static_cast<int>(g_dpi), 96);
+}
+
+void enableDpiAwareness()
+{
+    using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    auto setProcessDpiAwarenessContext = reinterpret_cast<SetProcessDpiAwarenessContextFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
+    if (setProcessDpiAwarenessContext &&
+        setProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+    {
+        return;
+    }
+
+    SetProcessDPIAware();
+}
+
+UINT systemDpi()
+{
+    HDC dc = GetDC(nullptr);
+    const UINT dpi = dc ? static_cast<UINT>(GetDeviceCaps(dc, LOGPIXELSX)) : 96;
+    if (dc)
+        ReleaseDC(nullptr, dc);
+    return dpi ? dpi : 96;
 }
 
 std::wstring toLower(std::wstring value)
@@ -508,21 +548,24 @@ struct EditorState
     HWND title = nullptr;
     HWND list = nullptr;
     HWND hint = nullptr;
+    HWND entry = nullptr;
 };
 
 void resizeEditor(HWND hwnd, EditorState* state)
 {
     RECT rect{};
     GetClientRect(hwnd, &rect);
-    const int margin = 22;
-    const int buttonY = rect.bottom - 52;
-    MoveWindow(state->title, margin, 18, rect.right - margin * 2, 28, TRUE);
-    MoveWindow(state->hint, margin, 50, rect.right - margin * 2, 24, TRUE);
-    MoveWindow(state->list, margin, 86, rect.right - margin * 2, buttonY - 100, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdAddExe), margin, buttonY, 106, 32, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdRemoveExe), margin + 118, buttonY, 92, 32, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdSave), rect.right - 184, buttonY, 78, 32, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdCancel), rect.right - 94, buttonY, 78, 32, TRUE);
+    const int margin = scale(22);
+    const int buttonY = rect.bottom - scale(52);
+    MoveWindow(state->title, margin, scale(18), rect.right - margin * 2, scale(28), TRUE);
+    MoveWindow(state->hint, margin, scale(50), rect.right - margin * 2, scale(24), TRUE);
+    MoveWindow(state->entry, margin, scale(82), rect.right - margin * 2 - scale(220), scale(32), TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdAddEntry), rect.right - margin - scale(210), scale(82), scale(78), scale(32), TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdAddExe), rect.right - margin - scale(122), scale(82), scale(122), scale(32), TRUE);
+    MoveWindow(state->list, margin, scale(126), rect.right - margin * 2, buttonY - scale(140), TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdRemoveExe), margin, buttonY, scale(92), scale(32), TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdSave), rect.right - scale(184), buttonY, scale(78), scale(32), TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdCancel), rect.right - scale(94), buttonY, scale(78), scale(32), TRUE);
 }
 
 void populateWhitelistList(HWND list)
@@ -553,6 +596,24 @@ void saveWhitelistList(HWND list)
     loadWhitelist();
 }
 
+void addEntryFromEdit(EditorState* state)
+{
+    const int len = GetWindowTextLengthW(state->entry);
+    if (len <= 0)
+        return;
+
+    std::wstring item(len + 1, L'\0');
+    GetWindowTextW(state->entry, item.data(), len + 1);
+    item.resize(len);
+    item = trim(item);
+    if (item.empty())
+        return;
+
+    SendMessageW(state->list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
+    SetWindowTextW(state->entry, L"");
+    SetFocus(state->entry);
+}
+
 LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     auto* state = reinterpret_cast<EditorState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -570,12 +631,18 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         state->hint = CreateWindowW(L"STATIC", L"Add executable names or full paths. Only these processes are touched.",
             WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, nullptr, g_instance, nullptr);
         setFont(state->hint);
+        state->entry = CreateWindowExW(0, L"EDIT", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            0, 0, 0, 0, hwnd, menuId(kIdEntry), g_instance, nullptr);
+        setFont(state->entry);
+        SendMessageW(state->entry, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"Example: 007FirstLight.exe"));
         state->list = CreateWindowExW(0, L"LISTBOX", nullptr,
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             0, 0, 0, 0, hwnd, nullptr, g_instance, nullptr);
         setFont(state->list);
         populateWhitelistList(state->list);
-        createButton(hwnd, kIdAddExe, L"Add EXE...");
+        createButton(hwnd, kIdAddEntry, L"Add");
+        createButton(hwnd, kIdAddExe, L"Browse EXE...");
         createButton(hwnd, kIdRemoveExe, L"Remove");
         createButton(hwnd, kIdSave, L"Save", BS_DEFPUSHBUTTON);
         createButton(hwnd, kIdCancel, L"Cancel");
@@ -586,7 +653,11 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
             resizeEditor(hwnd, state);
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wparam) == kIdAddExe)
+        if (LOWORD(wparam) == kIdAddEntry)
+        {
+            addEntryFromEdit(state);
+        }
+        else if (LOWORD(wparam) == kIdAddExe)
         {
             wchar_t file[MAX_PATH * 4]{};
             OPENFILENAMEW ofn{};
@@ -633,6 +704,13 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         SetBkColor(dc, g_fieldColor);
         return reinterpret_cast<LRESULT>(g_fieldBrush);
     }
+    case WM_CTLCOLOREDIT:
+    {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        SetTextColor(dc, g_textColor);
+        SetBkColor(dc, g_fieldColor);
+        return reinterpret_cast<LRESULT>(g_fieldBrush);
+    }
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
@@ -642,7 +720,7 @@ void showEditor(HWND owner)
     EditorState state{};
     HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, kEditorClass, L"Edit Whitelist",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 620, 460,
+        CW_USEDEFAULT, CW_USEDEFAULT, scale(620), scale(460),
         owner, nullptr, g_instance, &state);
     if (!hwnd)
         return;
@@ -672,12 +750,12 @@ void resizeLog(HWND hwnd, LogState* state)
 {
     RECT rect{};
     GetClientRect(hwnd, &rect);
-    const int margin = 22;
-    const int buttonY = rect.bottom - 52;
-    MoveWindow(state->title, margin, 18, rect.right - margin * 2, 28, TRUE);
-    MoveWindow(state->edit, margin, 58, rect.right - margin * 2, buttonY - 72, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdRefreshLog), margin, buttonY, 92, 32, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdClose), rect.right - 94, buttonY, 78, 32, TRUE);
+    const int margin = scale(22);
+    const int buttonY = rect.bottom - scale(52);
+    MoveWindow(state->title, margin, scale(18), rect.right - margin * 2, scale(28), TRUE);
+    MoveWindow(state->edit, margin, scale(58), rect.right - margin * 2, buttonY - scale(72), TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdRefreshLog), margin, buttonY, scale(92), scale(32), TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdClose), rect.right - scale(94), buttonY, scale(78), scale(32), TRUE);
 }
 
 LRESULT CALLBACK logProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
@@ -741,7 +819,7 @@ void showLog(HWND owner)
     LogState state{};
     HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, kLogClass, L"Log",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 620, 460,
+        CW_USEDEFAULT, CW_USEDEFAULT, scale(620), scale(460),
         owner, nullptr, g_instance, &state);
     if (!hwnd)
         return;
@@ -890,6 +968,8 @@ void initPaths()
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
+    enableDpiAwareness();
+    g_dpi = systemDpi();
     g_instance = instance;
     initPaths();
     initFonts();
