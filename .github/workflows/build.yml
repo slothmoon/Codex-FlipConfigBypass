@@ -1,0 +1,31 @@
+name: Build DLL
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build Release x64
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          mkdir bin\Release
+          cl /nologo /std:c++17 /O2 /MT /EHsc /LD /DWIN32_LEAN_AND_MEAN /DNOMINMAX src\dllmain.cpp /link /OUT:bin\Release\dxgi.dll /SUBSYSTEM:WINDOWS
+
+      - name: Upload dxgi.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisableFlipMetering-dxgi
+          path: bin\Release\dxgi.dll
+          if-no-files-found: error
