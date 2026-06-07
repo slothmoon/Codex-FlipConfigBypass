@@ -42,10 +42,13 @@ constexpr UINT kIdAddEntry = 2008;
 constexpr wchar_t kWindowClass[] = L"FlipConfigBypassTray";
 constexpr wchar_t kEditorClass[] = L"FlipConfigBypassEditor";
 constexpr wchar_t kRunValueName[] = L"FlipConfigBypass";
+constexpr wchar_t kInstanceMutexName[] = L"Local\\FlipConfigBypass.Instance";
+constexpr LONGLONG kMaxLogBytes = 2ll * 1024ll * 1024ll;
 
 HINSTANCE g_instance = nullptr;
 HWND g_window = nullptr;
 NOTIFYICONDATAW g_tray{};
+HANDLE g_instanceMutex = nullptr;
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_paused{ false };
 std::thread g_watcherThread;
@@ -256,6 +259,19 @@ void appendLog(const std::wstring& message)
     DWORD written = 0;
     WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
     CloseHandle(file);
+}
+
+void trimLogIfTooLarge()
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(g_logPath.c_str(), GetFileExInfoStandard, &data))
+        return;
+
+    LARGE_INTEGER size{};
+    size.HighPart = static_cast<LONG>(data.nFileSizeHigh);
+    size.LowPart = data.nFileSizeLow;
+    if (size.QuadPart > kMaxLogBytes)
+        writeTextFile(g_logPath, L"");
 }
 
 void ensureDefaultFiles()
@@ -828,13 +844,10 @@ void showEditor(HWND owner)
     SetForegroundWindow(owner);
 }
 
-void openLog(HWND owner)
+void openLog()
 {
     ensureDefaultFiles();
-    HINSTANCE result = ShellExecuteW(owner, L"open", g_logPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    std::wstring quotedLogPath = L"\"" + g_logPath + L"\"";
-    if (reinterpret_cast<INT_PTR>(result) <= 32)
-        ShellExecuteW(owner, L"open", L"notepad.exe", quotedLogPath.c_str(), nullptr, SW_SHOWNORMAL);
+    ShellExecuteW(nullptr, L"open", g_logPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void showTrayMenu(HWND hwnd)
@@ -896,7 +909,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
             showEditor(hwnd);
             return 0;
         case kIdViewLog:
-            openLog(hwnd);
+            openLog();
             return 0;
         case kIdPauseWatching:
             g_paused = !g_paused.load();
@@ -955,6 +968,30 @@ void initPaths()
     g_whitelistPath = joinPath(g_exeDir, L"whitelist.txt");
     g_logPath = joinPath(g_exeDir, L"FlipConfigBypass.log");
 }
+
+bool acquireSingleInstance()
+{
+    g_instanceMutex = CreateMutexW(nullptr, TRUE, kInstanceMutexName);
+    if (!g_instanceMutex)
+        return true;
+
+    if (GetLastError() != ERROR_ALREADY_EXISTS)
+        return true;
+
+    CloseHandle(g_instanceMutex);
+    g_instanceMutex = nullptr;
+    return false;
+}
+
+void releaseSingleInstance()
+{
+    if (!g_instanceMutex)
+        return;
+
+    ReleaseMutex(g_instanceMutex);
+    CloseHandle(g_instanceMutex);
+    g_instanceMutex = nullptr;
+}
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
@@ -963,6 +1000,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     g_dpi = systemDpi();
     g_instance = instance;
     initPaths();
+    if (!acquireSingleInstance())
+        return 0;
+
     initFonts();
     g_windowBrush = CreateSolidBrush(g_windowColor);
     g_fieldBrush = CreateSolidBrush(g_fieldColor);
@@ -971,16 +1011,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     if (!g_appIcon)
         g_appIcon = LoadIconW(nullptr, IDI_APPLICATION);
     ensureDefaultFiles();
+    trimLogIfTooLarge();
     loadWhitelist();
 
     if (!registerClasses())
+    {
+        releaseSingleInstance();
         return 1;
+    }
 
     g_window = CreateWindowW(kWindowClass, L"Flip Config Bypass", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         nullptr, nullptr, g_instance, nullptr);
     if (!g_window)
+    {
+        releaseSingleInstance();
         return 1;
+    }
 
     addTrayIcon(g_window);
     g_watcherThread = std::thread(watcherLoop);
@@ -1006,6 +1053,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         DeleteObject(g_windowBrush);
     if (g_fieldBrush)
         DeleteObject(g_fieldBrush);
+    releaseSingleInstance();
 
     return 0;
 }
