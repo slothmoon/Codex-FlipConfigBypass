@@ -51,6 +51,11 @@ HFONT g_uiFont = nullptr;
 HFONT g_titleFont = nullptr;
 HICON g_appIcon = nullptr;
 bool g_ownsAppIcon = false;
+HBRUSH g_windowBrush = nullptr;
+HBRUSH g_fieldBrush = nullptr;
+COLORREF g_textColor = RGB(24, 31, 39);
+COLORREF g_windowColor = RGB(248, 250, 252);
+COLORREF g_fieldColor = RGB(255, 255, 255);
 
 HMENU menuId(UINT id)
 {
@@ -124,7 +129,7 @@ void setFont(HWND hwnd, HFONT font = g_uiFont)
 
 HWND createButton(HWND parent, UINT id, const wchar_t* text, DWORD style = 0)
 {
-    HWND button = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | style,
+    HWND button = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_FLAT | style,
         0, 0, 0, 0, parent, menuId(id), g_instance, nullptr);
     setFont(button);
     return button;
@@ -558,15 +563,15 @@ void resizeEditor(HWND hwnd, EditorState* state)
 {
     RECT rect{};
     GetClientRect(hwnd, &rect);
-    const int margin = 18;
-    const int buttonY = rect.bottom - 48;
-    MoveWindow(state->title, margin, 14, rect.right - margin * 2, 28, TRUE);
-    MoveWindow(state->hint, margin, 44, rect.right - margin * 2, 24, TRUE);
-    MoveWindow(state->list, margin, 74, rect.right - margin * 2, buttonY - 86, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdAddExe), margin, buttonY, 96, 30, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdRemoveExe), margin + 106, buttonY, 86, 30, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdSave), rect.right - 174, buttonY, 76, 30, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdCancel), rect.right - 88, buttonY, 76, 30, TRUE);
+    const int margin = 22;
+    const int buttonY = rect.bottom - 52;
+    MoveWindow(state->title, margin, 18, rect.right - margin * 2, 28, TRUE);
+    MoveWindow(state->hint, margin, 50, rect.right - margin * 2, 24, TRUE);
+    MoveWindow(state->list, margin, 86, rect.right - margin * 2, buttonY - 100, TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdAddExe), margin, buttonY, 106, 32, TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdRemoveExe), margin + 118, buttonY, 92, 32, TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdSave), rect.right - 184, buttonY, 78, 32, TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdCancel), rect.right - 94, buttonY, 78, 32, TRUE);
 }
 
 void populateWhitelistList(HWND list)
@@ -614,8 +619,8 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         state->hint = CreateWindowW(L"STATIC", L"Add executable names or full paths. Only these processes are touched.",
             WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, nullptr, g_instance, nullptr);
         setFont(state->hint);
-        state->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+        state->list = CreateWindowExW(0, L"LISTBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             0, 0, 0, 0, hwnd, nullptr, g_instance, nullptr);
         setFont(state->list);
         populateWhitelistList(state->list);
@@ -663,6 +668,20 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, g_textColor);
+        return reinterpret_cast<LRESULT>(g_windowBrush);
+    }
+    case WM_CTLCOLORLISTBOX:
+    {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        SetTextColor(dc, g_textColor);
+        SetBkColor(dc, g_fieldColor);
+        return reinterpret_cast<LRESULT>(g_fieldBrush);
+    }
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
@@ -702,12 +721,12 @@ void resizeLog(HWND hwnd, LogState* state)
 {
     RECT rect{};
     GetClientRect(hwnd, &rect);
-    const int margin = 18;
-    const int buttonY = rect.bottom - 48;
-    MoveWindow(state->title, margin, 14, rect.right - margin * 2, 28, TRUE);
-    MoveWindow(state->edit, margin, 52, rect.right - margin * 2, buttonY - 64, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdRefreshLog), margin, buttonY, 86, 30, TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdClose), rect.right - 88, buttonY, 76, 30, TRUE);
+    const int margin = 22;
+    const int buttonY = rect.bottom - 52;
+    MoveWindow(state->title, margin, 18, rect.right - margin * 2, 28, TRUE);
+    MoveWindow(state->edit, margin, 58, rect.right - margin * 2, buttonY - 72, TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdRefreshLog), margin, buttonY, 92, 32, TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdClose), rect.right - 94, buttonY, 78, 32, TRUE);
 }
 
 LRESULT CALLBACK logProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
@@ -724,8 +743,8 @@ LRESULT CALLBACK logProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         state->title = CreateWindowW(L"STATIC", L"Recent events", WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd, nullptr, g_instance, nullptr);
         setFont(state->title, g_titleFont);
-        state->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", readTextFile(g_logPath).c_str(),
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+        state->edit = CreateWindowExW(0, L"EDIT", readTextFile(g_logPath).c_str(),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
             0, 0, 0, 0, hwnd, nullptr, g_instance, nullptr);
         setFont(state->edit);
         createButton(hwnd, kIdRefreshLog, L"Refresh");
@@ -748,6 +767,20 @@ LRESULT CALLBACK logProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, g_textColor);
+        return reinterpret_cast<LRESULT>(g_windowBrush);
+    }
+    case WM_CTLCOLOREDIT:
+    {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        SetTextColor(dc, g_textColor);
+        SetBkColor(dc, g_fieldColor);
+        return reinterpret_cast<LRESULT>(g_fieldBrush);
+    }
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
@@ -868,7 +901,7 @@ bool registerClasses()
     wc.lpszClassName = kWindowClass;
     wc.hIcon = g_appIcon;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.hbrBackground = g_windowBrush;
     if (!RegisterClassW(&wc))
         return false;
 
@@ -878,7 +911,7 @@ bool registerClasses()
     wc.lpszClassName = kEditorClass;
     wc.hIcon = g_appIcon;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.hbrBackground = g_windowBrush;
     if (!RegisterClassW(&wc))
         return false;
 
@@ -888,7 +921,7 @@ bool registerClasses()
     wc.lpszClassName = kLogClass;
     wc.hIcon = g_appIcon;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.hbrBackground = g_windowBrush;
     return RegisterClassW(&wc) != 0;
 }
 
@@ -909,6 +942,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     g_instance = instance;
     initPaths();
     initFonts();
+    g_windowBrush = CreateSolidBrush(g_windowColor);
+    g_fieldBrush = CreateSolidBrush(g_fieldColor);
     g_appIcon = createAppIcon();
     g_ownsAppIcon = g_appIcon != nullptr;
     if (!g_appIcon)
@@ -945,6 +980,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         DeleteObject(g_uiFont);
     if (g_titleFont)
         DeleteObject(g_titleFont);
+    if (g_windowBrush)
+        DeleteObject(g_windowBrush);
+    if (g_fieldBrush)
+        DeleteObject(g_fieldBrush);
 
     return 0;
 }
