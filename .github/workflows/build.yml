@@ -21,14 +21,17 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINSTALL=%%i
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           mkdir bin\Release
-          cl /nologo /std:c++17 /O2 /MT /EHsc /DWIN32_LEAN_AND_MEAN /DNOMINMAX src\app\main.cpp /Fe:bin\Release\FlipConfigBypass.exe /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib comdlg32.lib
-          cl /nologo /std:c++17 /O2 /MT /EHsc /LD /DWIN32_LEAN_AND_MEAN /DNOMINMAX src\payload\payload.cpp /Fe:bin\Release\FlipConfigPayload.dll /link /SUBSYSTEM:WINDOWS
+          mkdir obj\app
+          mkdir obj\payload
+          cl /nologo /std:c++17 /O2 /MT /EHsc /DWIN32_LEAN_AND_MEAN /DNOMINMAX /Fo"obj\app\\" /Fe"bin\Release\FlipConfigBypass.exe" src\app\main.cpp /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib comdlg32.lib
+          cl /nologo /std:c++17 /O2 /MT /EHsc /LD /DWIN32_LEAN_AND_MEAN /DNOMINMAX /Fo"obj\payload\\" /Fe"bin\Release\FlipConfigPayload.dll" src\payload\payload.cpp /link /SUBSYSTEM:WINDOWS
+          dir bin\Release
+          if not exist bin\Release\FlipConfigBypass.exe exit /b 1
+          if not exist bin\Release\FlipConfigPayload.dll exit /b 1
 
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
           name: FlipConfigBypass-x64
-          path: |
-            bin\Release\FlipConfigBypass.exe
-            bin\Release\FlipConfigPayload.dll
+          path: bin\Release
           if-no-files-found: error
