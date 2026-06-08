@@ -33,7 +33,7 @@ bool isNvApiModule(HMODULE module)
 
     const wchar_t* name = wcsrchr(path, L'\\');
     name = name ? name + 1 : path;
-    return _wcsicmp(name, L"nvapi64.dll") == 0 || _wcsicmp(name, L"nvapi.dll") == 0;
+    return _wcsicmp(name, L"nvapi64.dll") == 0;
 }
 
 bool rememberModule(HMODULE module)
@@ -58,23 +58,14 @@ void seedRealNvApiQueryInterface()
         return;
 
     GetProcAddressFn realGetProcAddress = g_realGetProcAddress.load(std::memory_order_acquire);
-    const wchar_t* nvApiModules[] = {
-        L"nvapi64.dll",
-        L"nvapi.dll"
-    };
-
-    for (const wchar_t* moduleName : nvApiModules)
+    HMODULE module = GetModuleHandleW(L"nvapi64.dll");
+    if (module)
     {
-        HMODULE module = GetModuleHandleW(moduleName);
-        if (!module)
-            continue;
-
         auto queryInterface = reinterpret_cast<NvApiQueryInterface>(
             realGetProcAddress(module, "nvapi_QueryInterface"));
         if (queryInterface)
         {
             g_realNvApiQueryInterface.store(queryInterface, std::memory_order_release);
-            return;
         }
     }
 }
@@ -243,17 +234,13 @@ void patchModuleImports(HMODULE module)
     void* originalNvQuery = nullptr;
     if (patchImport(module, "nvapi64.dll", "nvapi_QueryInterface", reinterpret_cast<void*>(&hookedNvApiQueryInterface), &originalNvQuery) && originalNvQuery)
         g_realNvApiQueryInterface.store(reinterpret_cast<NvApiQueryInterface>(originalNvQuery), std::memory_order_release);
-
-    originalNvQuery = nullptr;
-    if (patchImport(module, "nvapi.dll", "nvapi_QueryInterface", reinterpret_cast<void*>(&hookedNvApiQueryInterface), &originalNvQuery) && originalNvQuery)
-        g_realNvApiQueryInterface.store(reinterpret_cast<NvApiQueryInterface>(originalNvQuery), std::memory_order_release);
 }
 
 void scanAndPatchImports()
 {
     seedRealNvApiQueryInterface();
 
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snapshot == INVALID_HANDLE_VALUE)
         return;
 
