@@ -826,7 +826,7 @@ void showEditor(HWND owner)
 {
     EditorState state{};
     HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, kEditorClass, L"Flip Config Bypass - Whitelist",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+        WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, scale(620), scale(460),
         nullptr, nullptr, g_instance, &state);
     if (!hwnd)
