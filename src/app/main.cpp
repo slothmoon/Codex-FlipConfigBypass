@@ -630,12 +630,15 @@ void resizeEditor(HWND hwnd, EditorState* state)
     RECT rect{};
     GetClientRect(hwnd, &rect);
     const int margin = scale(22);
+    const int gap = scale(10);
+    const int addWidth = scale(78);
+    const int browseWidth = scale(100);
     const int buttonY = rect.bottom - scale(52);
     MoveWindow(state->title, margin, scale(18), rect.right - margin * 2, scale(28), TRUE);
     MoveWindow(state->hint, margin, scale(50), rect.right - margin * 2, scale(24), TRUE);
-    MoveWindow(state->entry, margin, scale(82), rect.right - margin * 2 - scale(220), scale(32), TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdAddEntry), rect.right - margin - scale(210), scale(82), scale(78), scale(32), TRUE);
-    MoveWindow(GetDlgItem(hwnd, kIdAddExe), rect.right - margin - scale(122), scale(82), scale(122), scale(32), TRUE);
+    MoveWindow(state->entry, margin, scale(82), rect.right - margin * 2 - addWidth - browseWidth - gap * 2, scale(32), TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdAddEntry), rect.right - margin - addWidth - browseWidth - gap, scale(82), addWidth, scale(32), TRUE);
+    MoveWindow(GetDlgItem(hwnd, kIdAddExe), rect.right - margin - browseWidth, scale(82), browseWidth, scale(32), TRUE);
     MoveWindow(state->list, margin, scale(126), rect.right - margin * 2, buttonY - scale(140), TRUE);
     MoveWindow(GetDlgItem(hwnd, kIdRemoveExe), margin, buttonY, scale(92), scale(32), TRUE);
     MoveWindow(GetDlgItem(hwnd, kIdSave), rect.right - scale(184), buttonY, scale(78), scale(32), TRUE);
@@ -743,7 +746,7 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         setFont(state->list);
         populateWhitelistList(state->list);
         createButton(hwnd, kIdAddEntry, L"Add");
-        createButton(hwnd, kIdAddExe, L"Browse EXE...");
+        createButton(hwnd, kIdAddExe, L"Browse...");
         createButton(hwnd, kIdRemoveExe, L"Remove");
         createButton(hwnd, kIdSave, L"Save", BS_DEFPUSHBUTTON);
         createButton(hwnd, kIdCancel, L"Cancel");
