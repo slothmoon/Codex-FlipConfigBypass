@@ -367,6 +367,12 @@ bool pidWasAttempted(DWORD pid)
     return g_attemptedPids.find(pid) != g_attemptedPids.end();
 }
 
+bool hasAttemptedPids()
+{
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    return !g_attemptedPids.empty();
+}
+
 void markPidAttempted(DWORD pid)
 {
     std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -541,6 +547,7 @@ void watcherLoop()
         if (!g_paused)
         {
             const WhitelistMatchSnapshot whitelist = whitelistMatchSnapshot();
+            const bool shouldPruneAttemptedPids = hasAttemptedPids();
             std::unordered_set<DWORD> livePids;
             HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (snapshot != INVALID_HANDLE_VALUE)
@@ -551,7 +558,8 @@ void watcherLoop()
                 {
                     do
                     {
-                        livePids.insert(entry.th32ProcessID);
+                        if (shouldPruneAttemptedPids)
+                            livePids.insert(entry.th32ProcessID);
                         if (pidWasAttempted(entry.th32ProcessID))
                             continue;
 
@@ -574,7 +582,8 @@ void watcherLoop()
                 }
 
                 CloseHandle(snapshot);
-                pruneAttemptedPids(livePids);
+                if (shouldPruneAttemptedPids)
+                    pruneAttemptedPids(livePids);
             }
         }
 
