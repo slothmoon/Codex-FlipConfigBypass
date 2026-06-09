@@ -20,6 +20,7 @@ constexpr unsigned int kMaxScannedModules = 512;
 
 std::atomic<NvApiQueryInterface> g_realNvApiQueryInterface{ nullptr };
 std::atomic<GetProcAddressFn> g_realGetProcAddress{ ::GetProcAddress };
+std::atomic<HMODULE> g_nvapiModule{ nullptr };
 std::atomic<bool> g_running{ true };
 // Owned only by the worker thread; keep scanAndPatchImports single-threaded.
 HMODULE g_scannedModules[kMaxScannedModules]{};
@@ -33,9 +34,13 @@ struct PeImageView
     DWORD size = 0;
 };
 
-bool isNvApiModule(HMODULE module)
+void cacheNvApiModule(HMODULE module)
 {
-    return module && module == GetModuleHandleW(L"nvapi64.dll");
+    if (!module)
+        return;
+
+    HMODULE expected = nullptr;
+    g_nvapiModule.compare_exchange_strong(expected, module, std::memory_order_relaxed, std::memory_order_relaxed);
 }
 
 bool rememberModule(HMODULE module)
@@ -65,11 +70,17 @@ void storeRealNvApiQueryInterfaceIfUnset(NvApiQueryInterface queryInterface)
 
 void seedRealNvApiQueryInterface()
 {
+    HMODULE module = g_nvapiModule.load(std::memory_order_relaxed);
+    if (!module)
+    {
+        module = GetModuleHandleW(L"nvapi64.dll");
+        cacheNvApiModule(module);
+    }
+
     if (g_realNvApiQueryInterface.load(std::memory_order_relaxed))
         return;
 
     GetProcAddressFn realGetProcAddress = g_realGetProcAddress.load(std::memory_order_relaxed);
-    HMODULE module = GetModuleHandleW(L"nvapi64.dll");
     if (module)
     {
         auto queryInterface = reinterpret_cast<NvApiQueryInterface>(
@@ -91,16 +102,28 @@ FARPROC WINAPI hookedGetProcAddress(HMODULE module, LPCSTR procName)
 {
     GetProcAddressFn realGetProcAddress = g_realGetProcAddress.load(std::memory_order_relaxed);
     FARPROC proc = realGetProcAddress(module, procName);
+    if (!proc)
+        return nullptr;
 
-    if (proc && procName && reinterpret_cast<uintptr_t>(procName) > 0xFFFF &&
-        std::strcmp(procName, "nvapi_QueryInterface") == 0 &&
-        isNvApiModule(module))
+    HMODULE nvapiModule = g_nvapiModule.load(std::memory_order_relaxed);
+    if (nvapiModule && module != nvapiModule)
+        return proc;
+
+    if (!procName || reinterpret_cast<uintptr_t>(procName) <= 0xFFFF ||
+        std::strcmp(procName, "nvapi_QueryInterface") != 0)
+        return proc;
+
+    if (!nvapiModule)
     {
-        storeRealNvApiQueryInterfaceIfUnset(reinterpret_cast<NvApiQueryInterface>(proc));
-        return reinterpret_cast<FARPROC>(&hookedNvApiQueryInterface);
+        nvapiModule = GetModuleHandleW(L"nvapi64.dll");
+        cacheNvApiModule(nvapiModule);
     }
 
-    return proc;
+    if (module != nvapiModule)
+        return proc;
+
+    storeRealNvApiQueryInterfaceIfUnset(reinterpret_cast<NvApiQueryInterface>(proc));
+    return reinterpret_cast<FARPROC>(&hookedNvApiQueryInterface);
 }
 
 bool rvaRangeInImage(const PeImageView& image, DWORD rva, SIZE_T bytes)
