@@ -16,12 +16,13 @@ namespace
 {
 constexpr int kModuleScanIterations = 120;
 constexpr DWORD kModuleScanIntervalMs = 1000;
+constexpr unsigned int kMaxScannedModules = 1024;
 
 std::atomic<NvApiQueryInterface> g_realNvApiQueryInterface{ nullptr };
 std::atomic<GetProcAddressFn> g_realGetProcAddress{ ::GetProcAddress };
 std::atomic<bool> g_running{ true };
 // Owned only by the worker thread; keep scanAndPatchImports single-threaded.
-HMODULE g_scannedModules[512]{};
+HMODULE g_scannedModules[kMaxScannedModules]{};
 unsigned int g_scannedModuleCount = 0;
 
 void* __cdecl hookedNvApiQueryInterface(unsigned int interfaceId);
@@ -45,7 +46,7 @@ bool rememberModule(HMODULE module)
             return false;
     }
 
-    if (g_scannedModuleCount >= static_cast<unsigned int>(sizeof(g_scannedModules) / sizeof(g_scannedModules[0])))
+    if (g_scannedModuleCount >= kMaxScannedModules)
         return false;
 
     g_scannedModules[g_scannedModuleCount++] = module;
@@ -148,17 +149,13 @@ bool patchThunk(IMAGE_THUNK_DATA* thunk, void* replacement, void** original)
         reinterpret_cast<PVOID volatile*>(&thunk->u1.Function),
         replacement,
         current);
+    DWORD ignoredProtect = 0;
+    VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &ignoredProtect);
     if (previous != current)
-    {
-        DWORD ignoredProtect = 0;
-        VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &ignoredProtect);
         return false;
-    }
 
     if (original && !*original)
         *original = current;
-    DWORD ignoredProtect = 0;
-    VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &ignoredProtect);
     return true;
 }
 
@@ -285,6 +282,9 @@ void patchModuleImports(HMODULE module)
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
+#ifdef _DEBUG
+        OutputDebugStringW(L"FlipConfigPayload: skipped module after import patch exception.\n");
+#endif
         // Ignore unusual or transient module layouts rather than crashing the target process.
     }
 }
@@ -334,6 +334,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void*)
         HMODULE pinned = nullptr;
         if (!GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            // FROM_ADDRESS treats this as an address inside the payload, not as a string.
             reinterpret_cast<LPCWSTR>(workerThread),
             &pinned))
         {
@@ -346,6 +347,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void*)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        // The DLL is pinned; detach is expected only during process teardown.
+        // Do not wait for the worker from DllMain.
         g_running = false;
     }
 
