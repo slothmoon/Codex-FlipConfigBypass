@@ -314,10 +314,10 @@ void scanAndPatchImports()
 
 DWORD WINAPI workerThread(void*)
 {
-    for (int i = 0; g_running && i < kModuleScanIterations; ++i)
+    for (int i = 0; g_running.load(std::memory_order_relaxed) && i < kModuleScanIterations; ++i)
     {
         scanAndPatchImports();
-        if (i + 1 < kModuleScanIterations && g_running)
+        if (i + 1 < kModuleScanIterations && g_running.load(std::memory_order_relaxed))
             Sleep(kModuleScanIntervalMs);
     }
 
