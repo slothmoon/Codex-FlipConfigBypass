@@ -180,6 +180,12 @@ void patchModuleImportsUnsafe(HMODULE module)
         return;
 
     GetProcAddressFn realGetProcAddress = g_realGetProcAddress.load(std::memory_order_acquire);
+    void* kernel32GetProc = nullptr;
+    void* kernelbaseGetProc = nullptr;
+    void* nvapiQuery = nullptr;
+    bool kernel32GetProcResolved = false;
+    bool kernelbaseGetProcResolved = false;
+    bool nvapiQueryResolved = false;
     void* originalNvQuery = nullptr;
 
     const DWORD maxDescriptors = importDir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
@@ -197,19 +203,34 @@ void patchModuleImportsUnsafe(HMODULE module)
         if (_stricmp(dllName, "KERNEL32.dll") == 0)
         {
             procName = "GetProcAddress";
-            targetProc = procAddressFrom("KERNEL32.dll", "GetProcAddress", realGetProcAddress);
+            if (!kernel32GetProcResolved)
+            {
+                kernel32GetProc = procAddressFrom("KERNEL32.dll", "GetProcAddress", realGetProcAddress);
+                kernel32GetProcResolved = true;
+            }
+            targetProc = kernel32GetProc;
             replacement = reinterpret_cast<void*>(&hookedGetProcAddress);
         }
         else if (_stricmp(dllName, "KERNELBASE.dll") == 0)
         {
             procName = "GetProcAddress";
-            targetProc = procAddressFrom("KERNELBASE.dll", "GetProcAddress", realGetProcAddress);
+            if (!kernelbaseGetProcResolved)
+            {
+                kernelbaseGetProc = procAddressFrom("KERNELBASE.dll", "GetProcAddress", realGetProcAddress);
+                kernelbaseGetProcResolved = true;
+            }
+            targetProc = kernelbaseGetProc;
             replacement = reinterpret_cast<void*>(&hookedGetProcAddress);
         }
         else if (_stricmp(dllName, "nvapi64.dll") == 0)
         {
             procName = "nvapi_QueryInterface";
-            targetProc = procAddressFrom("nvapi64.dll", "nvapi_QueryInterface", realGetProcAddress);
+            if (!nvapiQueryResolved)
+            {
+                nvapiQuery = procAddressFrom("nvapi64.dll", "nvapi_QueryInterface", realGetProcAddress);
+                nvapiQueryResolved = true;
+            }
+            targetProc = nvapiQuery;
             storeRealNvApiQueryInterfaceIfUnset(reinterpret_cast<NvApiQueryInterface>(targetProc));
             replacement = reinterpret_cast<void*>(&hookedNvApiQueryInterface);
             original = &originalNvQuery;
