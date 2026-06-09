@@ -16,7 +16,7 @@ namespace
 {
 constexpr int kModuleScanIterations = 120;
 constexpr DWORD kModuleScanIntervalMs = 1000;
-constexpr unsigned int kMaxScannedModules = 1024;
+constexpr unsigned int kMaxScannedModules = 512;
 
 std::atomic<NvApiQueryInterface> g_realNvApiQueryInterface{ nullptr };
 std::atomic<GetProcAddressFn> g_realGetProcAddress{ ::GetProcAddress };
