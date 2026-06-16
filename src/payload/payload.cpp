@@ -409,8 +409,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void*)
         }
 
         HANDLE thread = CreateThread(nullptr, 0, workerThread, nullptr, 0, nullptr);
-        if (thread)
-            CloseHandle(thread);
+        if (!thread)
+            return FALSE;
+
+        CloseHandle(thread);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {

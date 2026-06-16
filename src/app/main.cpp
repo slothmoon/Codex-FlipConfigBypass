@@ -1012,7 +1012,7 @@ bool acquireSingleInstance()
 {
     g_instanceMutex = CreateMutexW(nullptr, TRUE, kInstanceMutexName);
     if (!g_instanceMutex)
-        return true;
+        return false;
 
     if (GetLastError() != ERROR_ALREADY_EXISTS)
         return true;
