@@ -45,11 +45,13 @@ constexpr wchar_t kEditorClass[] = L"FlipConfigBypassEditor";
 constexpr wchar_t kRunValueName[] = L"FlipConfigBypass";
 constexpr wchar_t kInstanceMutexName[] = L"Local\\FlipConfigBypass.Instance";
 constexpr LONGLONG kMaxLogBytes = 2ll * 1024ll * 1024ll;
+constexpr DWORD kWatcherScanIntervalMs = 2000;
 
 HINSTANCE g_instance = nullptr;
 HWND g_window = nullptr;
 NOTIFYICONDATAW g_tray{};
 HANDLE g_instanceMutex = nullptr;
+HANDLE g_stopEvent = nullptr;
 UINT g_taskbarCreatedMessage = 0;
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_paused{ false };
@@ -376,15 +378,15 @@ void markPidAttempted(DWORD pid)
     g_attemptedPids.insert(pid);
 }
 
-void pruneAttemptedPids(const std::unordered_set<DWORD>& livePids)
+std::unordered_set<DWORD> attemptedPidsSnapshot()
 {
-    for (auto it = g_attemptedPids.begin(); it != g_attemptedPids.end();)
-    {
-        if (livePids.find(*it) == livePids.end())
-            it = g_attemptedPids.erase(it);
-        else
-            ++it;
-    }
+    return g_attemptedPids;
+}
+
+void removeAttemptedPids(const std::unordered_set<DWORD>& pids)
+{
+    for (DWORD pid : pids)
+        g_attemptedPids.erase(pid);
 }
 
 bool matchesWhitelistedPath(const WhitelistMatchSnapshot& whitelist, const std::wstring& fullPath)
@@ -540,9 +542,13 @@ void watcherLoop()
         {
             const WhitelistMatchSnapshot whitelist = whitelistMatchSnapshot();
             const bool shouldPruneAttemptedPids = hasAttemptedPids();
-            if (!whitelist.names.empty() || whitelist.hasPathEntries || shouldPruneAttemptedPids)
+            const bool hasWhitelistEntries = !whitelist.names.empty() || whitelist.hasPathEntries;
+            if (hasWhitelistEntries || shouldPruneAttemptedPids)
             {
-                std::unordered_set<DWORD> livePids;
+                std::unordered_set<DWORD> missingAttemptedPids;
+                if (shouldPruneAttemptedPids)
+                    missingAttemptedPids = attemptedPidsSnapshot();
+
                 HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
                 if (snapshot != INVALID_HANDLE_VALUE)
                 {
@@ -552,9 +558,11 @@ void watcherLoop()
                     {
                         do
                         {
+                            const DWORD pid = entry.th32ProcessID;
                             if (shouldPruneAttemptedPids)
-                                livePids.insert(entry.th32ProcessID);
-                            if (pidWasAttempted(entry.th32ProcessID))
+                                missingAttemptedPids.erase(pid);
+
+                            if (!hasWhitelistEntries || pidWasAttempted(pid))
                                 continue;
 
                             const std::wstring exeName = entry.szExeFile;
@@ -564,26 +572,33 @@ void watcherLoop()
                             if (!nameMatched && whitelist.hasPathEntries &&
                                 whitelist.pathNames.find(exeLower) != whitelist.pathNames.end())
                             {
-                                fullPath = processPath(entry.th32ProcessID);
+                                fullPath = processPath(pid);
                             }
 
                             if (nameMatched || matchesWhitelistedPath(whitelist, fullPath))
                             {
-                                markPidAttempted(entry.th32ProcessID);
-                                injectPayload(entry.th32ProcessID, exeName);
+                                markPidAttempted(pid);
+                                injectPayload(pid, exeName);
                             }
                         } while (Process32NextW(snapshot, &entry));
                     }
 
                     CloseHandle(snapshot);
                     if (shouldPruneAttemptedPids)
-                        pruneAttemptedPids(livePids);
+                        removeAttemptedPids(missingAttemptedPids);
                 }
             }
         }
 
-        for (int i = 0; g_running.load(std::memory_order_relaxed) && i < 20; ++i)
-            Sleep(100);
+        if (g_stopEvent)
+        {
+            if (WaitForSingleObject(g_stopEvent, kWatcherScanIntervalMs) == WAIT_OBJECT_0)
+                break;
+        }
+        else
+        {
+            Sleep(kWatcherScanIntervalMs);
+        }
     }
 }
 
@@ -964,6 +979,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         break;
     case WM_DESTROY:
         g_running.store(false, std::memory_order_relaxed);
+        if (g_stopEvent)
+            SetEvent(g_stopEvent);
         removeTrayIcon();
         PostQuitMessage(0);
         return 0;
@@ -1031,6 +1048,15 @@ void releaseSingleInstance()
     CloseHandle(g_instanceMutex);
     g_instanceMutex = nullptr;
 }
+
+void closeStopEvent()
+{
+    if (!g_stopEvent)
+        return;
+
+    CloseHandle(g_stopEvent);
+    g_stopEvent = nullptr;
+}
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
@@ -1041,6 +1067,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     initPaths();
     if (!acquireSingleInstance())
         return 0;
+    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
     g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     initFonts();
@@ -1056,6 +1083,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     if (!registerClasses())
     {
+        closeStopEvent();
         releaseSingleInstance();
         return 1;
     }
@@ -1065,6 +1093,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         nullptr, nullptr, g_instance, nullptr);
     if (!g_window)
     {
+        closeStopEvent();
         releaseSingleInstance();
         return 1;
     }
@@ -1080,6 +1109,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     }
 
     g_running.store(false, std::memory_order_relaxed);
+    if (g_stopEvent)
+        SetEvent(g_stopEvent);
     if (g_watcherThread.joinable())
         g_watcherThread.join();
 
@@ -1093,6 +1124,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         DeleteObject(g_windowBrush);
     if (g_fieldBrush)
         DeleteObject(g_fieldBrush);
+    closeStopEvent();
     releaseSingleInstance();
 
     return 0;
