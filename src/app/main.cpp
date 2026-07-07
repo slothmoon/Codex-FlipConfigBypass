@@ -62,6 +62,7 @@ std::unordered_set<std::wstring> g_whitelistNames;
 std::unordered_set<std::wstring> g_whitelistPaths;
 std::unordered_set<std::wstring> g_whitelistPathNames;
 bool g_hasPathWhitelist = false;
+// Owned by watcherLoop only; add synchronization before touching this from UI code.
 std::unordered_set<DWORD> g_attemptedPids;
 std::wstring g_exePath;
 std::wstring g_exeDir;
@@ -523,11 +524,19 @@ bool injectPayload(DWORD pid, const std::wstring& exeName)
 
     const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
     if (!remoteThreadTimedOut)
+    {
         VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
+    }
+    else
+    {
+        // LoadLibraryW may still be reading remotePath after timeout; leave it allocated rather than racing the target.
+    }
     CloseHandle(process);
 
     if (ok)
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - injected OK");
+    else if (remoteThreadTimedOut)
+        appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, remote thread timed out; remote path cleanup skipped");
     else
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, " + lastErrorText(error));
 
@@ -1014,15 +1023,23 @@ bool registerClasses()
     return true;
 }
 
-void initPaths()
+bool initPaths()
 {
     wchar_t path[MAX_PATH * 4]{};
-    GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
-    g_exePath = path;
-    g_exeDir = g_exePath.substr(0, g_exePath.find_last_of(L"\\/"));
+    const DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
+    if (length == 0 || length >= std::size(path))
+        return false;
+
+    g_exePath.assign(path, length);
+    const size_t slash = g_exePath.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+        return false;
+
+    g_exeDir = g_exePath.substr(0, slash);
     g_payloadPath = joinPath(g_exeDir, L"FlipConfigPayload.dll");
     g_whitelistPath = joinPath(g_exeDir, L"whitelist.txt");
     g_logPath = joinPath(g_exeDir, L"FlipConfigBypass.log");
+    return true;
 }
 
 bool acquireSingleInstance()
@@ -1064,7 +1081,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     enableDpiAwareness();
     g_dpi = systemDpi();
     g_instance = instance;
-    initPaths();
+    if (!initPaths())
+        return 1;
     if (!acquireSingleInstance())
         return 0;
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
