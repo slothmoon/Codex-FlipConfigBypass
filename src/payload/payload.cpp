@@ -287,7 +287,9 @@ void patchMatchingThunks(const PeImageView& image, IMAGE_IMPORT_DESCRIPTOR* desc
             !IMAGE_SNAP_BY_ORDINAL(origThunk[thunkIndex].u1.Ordinal))
         {
             auto* importByName = rvaToPtr<IMAGE_IMPORT_BY_NAME>(image, static_cast<DWORD>(origThunk[thunkIndex].u1.AddressOfData));
-            shouldPatch = importByName && std::strcmp(reinterpret_cast<const char*>(importByName->Name), target.procName) == 0;
+            shouldPatch = importByName && target.targetProc &&
+                reinterpret_cast<void*>(thunk->u1.Function) == target.targetProc &&
+                std::strcmp(reinterpret_cast<const char*>(importByName->Name), target.procName) == 0;
         }
         else if (target.targetProc)
         {

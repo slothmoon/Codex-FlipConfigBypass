@@ -1120,7 +1120,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     g_watcherThread = std::thread(watcherLoop);
 
     MSG msg{};
-    while (GetMessageW(&msg, nullptr, 0, 0))
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0)
     {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
