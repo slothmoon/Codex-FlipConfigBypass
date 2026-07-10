@@ -60,6 +60,7 @@ std::atomic<bool> g_running{ true };
 std::atomic<bool> g_paused{ false };
 std::thread g_watcherThread;
 std::mutex g_stateMutex;
+std::atomic<std::uint64_t> g_whitelistVersion{ 1 };
 std::vector<std::wstring> g_whitelist;
 std::unordered_set<std::wstring> g_whitelistNames;
 std::unordered_set<std::wstring> g_whitelistPaths;
@@ -348,6 +349,7 @@ void loadWhitelist()
     g_whitelistPaths = std::move(paths);
     g_whitelistPathNames = std::move(pathNames);
     g_hasPathWhitelist = !g_whitelistPaths.empty();
+    g_whitelistVersion.fetch_add(1, std::memory_order_release);
 }
 
 std::vector<std::wstring> whitelistSnapshot()
@@ -364,10 +366,20 @@ struct WhitelistMatchSnapshot
     bool hasPathEntries = false;
 };
 
-WhitelistMatchSnapshot whitelistMatchSnapshot()
+void refreshWhitelistMatchSnapshot(
+    WhitelistMatchSnapshot& snapshot,
+    std::uint64_t& snapshotVersion)
 {
+    const std::uint64_t currentVersion = g_whitelistVersion.load(std::memory_order_acquire);
+    if (snapshotVersion == currentVersion)
+        return;
+
     std::lock_guard<std::mutex> lock(g_stateMutex);
-    return { g_whitelistNames, g_whitelistPaths, g_whitelistPathNames, g_hasPathWhitelist };
+    snapshot.names = g_whitelistNames;
+    snapshot.paths = g_whitelistPaths;
+    snapshot.pathNames = g_whitelistPathNames;
+    snapshot.hasPathEntries = g_hasPathWhitelist;
+    snapshotVersion = g_whitelistVersion.load(std::memory_order_relaxed);
 }
 
 constexpr ULONGLONG kUnknownProcessCreationTime = 0;
@@ -639,11 +651,14 @@ void watcherLoop()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
+    WhitelistMatchSnapshot whitelist;
+    std::uint64_t whitelistVersion = 0;
+
     while (g_running.load(std::memory_order_relaxed))
     {
         if (!g_paused.load(std::memory_order_relaxed))
         {
-            const WhitelistMatchSnapshot whitelist = whitelistMatchSnapshot();
+            refreshWhitelistMatchSnapshot(whitelist, whitelistVersion);
             const bool shouldPruneAttemptedPids = hasAttemptedProcesses();
             const bool hasWhitelistEntries = !whitelist.names.empty() || whitelist.hasPathEntries;
             if (hasWhitelistEntries || shouldPruneAttemptedPids)
@@ -668,8 +683,7 @@ void watcherLoop()
                             if (!hasWhitelistEntries)
                                 continue;
 
-                            const std::wstring exeName = entry.szExeFile;
-                            const std::wstring exeLower = toLower(exeName);
+                            const std::wstring exeLower = toLower(std::wstring(entry.szExeFile));
                             const bool nameMatched = whitelist.names.find(exeLower) != whitelist.names.end();
                             const bool pathNameMatched = !nameMatched && whitelist.hasPathEntries &&
                                 whitelist.pathNames.find(exeLower) != whitelist.pathNames.end();
@@ -684,6 +698,7 @@ void watcherLoop()
                             {
                                 if (nameMatched)
                                 {
+                                    const std::wstring exeName = entry.szExeFile;
                                     markProcessAttempted(pid, kUnknownProcessCreationTime);
                                     appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, could not identify process instance");
                                 }
@@ -696,6 +711,7 @@ void watcherLoop()
                             if (!nameMatched && !matchesWhitelistedPath(whitelist, metadata.fullPath))
                                 continue;
 
+                            const std::wstring exeName = entry.szExeFile;
                             markProcessAttempted(pid, metadata.creationTime);
                             injectPayload(pid, exeName);
                         } while (Process32NextW(snapshot, &entry));

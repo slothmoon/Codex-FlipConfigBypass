@@ -72,37 +72,6 @@ bool moduleAddressLess(HMODULE left, HMODULE right)
     return reinterpret_cast<std::uintptr_t>(left) < reinterpret_cast<std::uintptr_t>(right);
 }
 
-bool rememberModule(ModuleScanState& state, HMODULE module)
-{
-    auto it = std::lower_bound(
-        state.scannedModules.begin(), state.scannedModules.end(), module, moduleAddressLess);
-    if (it != state.scannedModules.end() && *it == module)
-        return false;
-
-    state.scannedModules.insert(it, module);
-    return true;
-}
-
-void forgetUnloadedModules(ModuleScanState& state, std::size_t moduleCount)
-{
-    const auto liveBegin = state.modules.begin();
-    const auto liveEnd = liveBegin + moduleCount;
-
-    HMODULE nvapiModule = g_nvapiModule.load(std::memory_order_relaxed);
-    if (nvapiModule && !std::binary_search(liveBegin, liveEnd, nvapiModule, moduleAddressLess))
-    {
-        g_realNvApiQueryInterface.store(nullptr, std::memory_order_release);
-        g_nvapiModule.store(nullptr, std::memory_order_relaxed);
-    }
-
-    const auto firstUnloaded = std::remove_if(
-        state.scannedModules.begin(), state.scannedModules.end(),
-        [liveBegin, liveEnd](HMODULE module) {
-            return !std::binary_search(liveBegin, liveEnd, module, moduleAddressLess);
-        });
-    state.scannedModules.erase(firstUnloaded, state.scannedModules.end());
-}
-
 void storeRealNvApiQueryInterfaceIfUnset(NvApiQueryInterface queryInterface)
 {
     if (!queryInterface || queryInterface == &hookedNvApiQueryInterface)
@@ -426,15 +395,34 @@ void scanAndPatchImports(ModuleScanState& state)
 
     auto liveEnd = state.modules.begin() + moduleCount;
     std::sort(state.modules.begin(), liveEnd, moduleAddressLess);
-    forgetUnloadedModules(state, moduleCount);
     if (state.scannedModules.capacity() < state.modules.size())
         state.scannedModules.reserve(state.modules.size());
 
-    for (auto it = state.modules.begin(); it != liveEnd; ++it)
+    HMODULE nvapiModule = g_nvapiModule.load(std::memory_order_relaxed);
+    if (nvapiModule && !std::binary_search(
+        state.modules.begin(), liveEnd, nvapiModule, moduleAddressLess))
     {
-        if (rememberModule(state, *it))
-            patchModuleImports(*it);
+        g_realNvApiQueryInterface.store(nullptr, std::memory_order_release);
+        g_nvapiModule.store(nullptr, std::memory_order_relaxed);
     }
+
+    auto scannedIt = state.scannedModules.begin();
+    const auto scannedEnd = state.scannedModules.end();
+    for (auto liveIt = state.modules.begin(); liveIt != liveEnd; ++liveIt)
+    {
+        while (scannedIt != scannedEnd && moduleAddressLess(*scannedIt, *liveIt))
+            ++scannedIt;
+
+        if (scannedIt != scannedEnd && *scannedIt == *liveIt)
+        {
+            ++scannedIt;
+            continue;
+        }
+
+        patchModuleImports(*liveIt);
+    }
+
+    state.scannedModules.assign(state.modules.begin(), liveEnd);
 }
 
 DWORD workerThreadMain()
