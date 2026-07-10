@@ -28,6 +28,7 @@ static_assert(sizeof(void*) == 8, "FlipConfigBypass must be built as x64.");
 namespace
 {
 constexpr UINT kTrayMessage = WM_APP + 1;
+constexpr UINT kWatcherStatusMessage = WM_APP + 2;
 constexpr UINT kIdEditWhitelist = 1001;
 constexpr UINT kIdViewLog = 1002;
 constexpr UINT kIdPauseWatching = 1003;
@@ -62,6 +63,7 @@ std::vector<std::wstring> g_whitelistNames;
 std::vector<std::wstring> g_whitelistPaths;
 std::vector<std::wstring> g_whitelistPathNames;
 bool g_hasPathWhitelist = false;
+std::wstring g_activeProcessName;
 // Owned by watcherLoop only; add synchronization before touching this from UI code.
 struct AttemptedProcess
 {
@@ -372,6 +374,23 @@ std::vector<std::wstring> whitelistSnapshot()
 {
     std::lock_guard<std::mutex> lock(g_stateMutex);
     return g_whitelist;
+}
+
+std::wstring activeProcessNameSnapshot()
+{
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    return g_activeProcessName;
+}
+
+void setActiveProcessName(std::wstring name)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        g_activeProcessName = std::move(name);
+    }
+
+    if (g_window)
+        PostMessageW(g_window, kWatcherStatusMessage, 0, 0);
 }
 
 struct WhitelistMatchSnapshot
@@ -748,12 +767,14 @@ void watcherLoop()
                 activeProcess = nullptr;
                 g_attemptedProcesses.erase(activePid);
                 activePid = 0;
+                setActiveProcessName({});
             }
             else if (waitResult == WAIT_FAILED)
             {
                 CloseHandle(activeProcess);
                 activeProcess = nullptr;
                 activePid = 0;
+                setActiveProcessName({});
             }
 
             continue;
@@ -810,9 +831,11 @@ void watcherLoop()
                                 continue;
 
                             markProcessAttempted(pid, metadata.creationTime, scanGeneration);
-                            if (injectPayload(pid, metadata.creationTime, std::wstring(exeName), activeProcess))
+                            std::wstring matchedExeName(exeName);
+                            if (injectPayload(pid, metadata.creationTime, matchedExeName, activeProcess))
                             {
                                 activePid = pid;
+                                setActiveProcessName(std::move(matchedExeName));
                                 enumerationCompleted = false;
                                 break;
                             }
@@ -885,8 +908,14 @@ void setStartWithWindows(bool enabled)
 void updateTrayTip()
 {
     const size_t watched = whitelistSnapshot().size();
+    const std::wstring activeProcessName = activeProcessNameSnapshot();
     std::wstring tip = L"Flip Config Bypass\r\n";
-    tip += g_paused.load(std::memory_order_relaxed) ? L"Paused" : L"Watching " + std::to_wstring(watched) + L" apps";
+    if (!activeProcessName.empty())
+        tip += L"Scanning stopped: " + activeProcessName + L" is running";
+    else if (g_paused.load(std::memory_order_relaxed))
+        tip += L"Paused";
+    else
+        tip += L"Watching " + std::to_wstring(watched) + L" apps";
     wcsncpy_s(g_tray.szTip, tip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
 }
@@ -1148,7 +1177,10 @@ void showTrayMenu(HWND hwnd)
     HMENU menu = CreatePopupMenu();
     const size_t watched = whitelistSnapshot().size();
     const bool paused = g_paused.load(std::memory_order_relaxed);
-    const std::wstring status = (paused ? L"Paused - " : L"Running - ") + std::to_wstring(watched) + L" apps watched";
+    const std::wstring activeProcessName = activeProcessNameSnapshot();
+    const std::wstring status = !activeProcessName.empty()
+        ? L"Scanning stopped - " + activeProcessName + L" is running"
+        : (paused ? L"Paused - " : L"Running - ") + std::to_wstring(watched) + L" apps watched";
 
     AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"Flip Config Bypass");
     AppendMenuW(menu, MF_STRING | MF_DISABLED | (paused ? 0 : MF_CHECKED), 0, status.c_str());
@@ -1197,6 +1229,9 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     case kTrayMessage:
         if (lparam == WM_RBUTTONUP || lparam == WM_LBUTTONUP)
             showTrayMenu(hwnd);
+        return 0;
+    case kWatcherStatusMessage:
+        updateTrayTip();
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wparam))

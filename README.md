@@ -64,6 +64,8 @@ Right-click the tray icon to:
 - toggle Start with Windows
 - exit
 
+Hover over the tray icon to see whether the app is watching, paused, or waiting for an injected game to exit.
+
 Only one instance can run at a time.
 
 ## Whitelist
