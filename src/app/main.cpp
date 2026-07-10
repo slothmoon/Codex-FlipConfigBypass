@@ -382,6 +382,12 @@ std::wstring activeProcessNameSnapshot()
     return g_activeProcessName;
 }
 
+bool activeProcessRunning()
+{
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    return !g_activeProcessName.empty();
+}
+
 void setActiveProcessName(std::wstring name)
 {
     {
@@ -1177,13 +1183,13 @@ void showTrayMenu(HWND hwnd)
     HMENU menu = CreatePopupMenu();
     const size_t watched = whitelistSnapshot().size();
     const bool paused = g_paused.load(std::memory_order_relaxed);
-    const std::wstring activeProcessName = activeProcessNameSnapshot();
-    const std::wstring status = !activeProcessName.empty()
-        ? L"Scanning stopped - " + activeProcessName + L" is running"
+    const bool gameActive = activeProcessRunning();
+    const std::wstring status = gameActive
+        ? L"Game active - scanning stopped"
         : (paused ? L"Paused - " : L"Running - ") + std::to_wstring(watched) + L" apps watched";
 
     AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"Flip Config Bypass");
-    AppendMenuW(menu, MF_STRING | MF_DISABLED | (paused ? 0 : MF_CHECKED), 0, status.c_str());
+    AppendMenuW(menu, MF_STRING | MF_DISABLED | (!paused && !gameActive ? MF_CHECKED : 0), 0, status.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kIdEditWhitelist, L"Edit Whitelist...");
     AppendMenuW(menu, MF_STRING, kIdViewLog, L"Open Log...");
