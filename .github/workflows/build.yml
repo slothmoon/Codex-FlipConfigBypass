@@ -29,12 +29,12 @@ jobs:
           mkdir obj\payload
           rc /nologo /fo obj\app\app.res src\app\app.rc
           if errorlevel 1 exit /b 1
-          cl /nologo /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /Fo"obj\app\\" /Fe"bin\Release\FlipConfigBypass.exe" src\app\main.cpp obj\app\app.res /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib comdlg32.lib gdi32.lib advapi32.lib /MANIFESTDEPENDENCY:"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+          cl /nologo /std:c++17 /O2 /W4 /WX /wd4191 /permissive- /MT /EHsc /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /Fo"obj\app\\" /Fe"bin\Release\FlipConfigBypass.exe" src\app\main.cpp obj\app\app.res /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib comdlg32.lib gdi32.lib advapi32.lib /MANIFESTDEPENDENCY:"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
           if errorlevel 1 exit /b 1
           mt /nologo -manifest bin\Release\FlipConfigBypass.exe.manifest -outputresource:bin\Release\FlipConfigBypass.exe;#1
           if errorlevel 1 exit /b 1
           del bin\Release\FlipConfigBypass.exe.manifest
-          cl /nologo /std:c++17 /O2 /MT /EHsc /LD /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /Fo"obj\payload\\" /Fe"bin\Release\FlipConfigPayload.dll" src\payload\payload.cpp /link /SUBSYSTEM:WINDOWS
+          cl /nologo /std:c++17 /O2 /W4 /WX /wd4191 /permissive- /MT /EHsc /LD /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /Fo"obj\payload\\" /Fe"bin\Release\FlipConfigPayload.dll" src\payload\payload.cpp /link /SUBSYSTEM:WINDOWS
           if errorlevel 1 exit /b 1
           dir bin\Release
           if not exist bin\Release\FlipConfigBypass.exe exit /b 1

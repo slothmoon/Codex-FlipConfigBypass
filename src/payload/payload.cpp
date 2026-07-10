@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "../shared/flip_config.h"
 
@@ -17,7 +18,7 @@ namespace
 {
 constexpr int kModuleScanIterations = 120;
 constexpr DWORD kModuleScanIntervalMs = 1000;
-constexpr unsigned int kMaxScannedModules = 512;
+constexpr std::size_t kInitialModuleCapacity = 512;
 
 std::atomic<NvApiQueryInterface> g_realNvApiQueryInterface{ nullptr };
 std::atomic<GetProcAddressFn> g_realGetProcAddress{ ::GetProcAddress };
@@ -25,9 +26,6 @@ std::atomic<HMODULE> g_nvapiModule{ nullptr };
 std::atomic<void*> g_kernel32GetProcAddress{ nullptr };
 std::atomic<void*> g_kernelbaseGetProcAddress{ nullptr };
 std::atomic<bool> g_running{ true };
-// Owned only by the worker thread; keep scanAndPatchImports single-threaded.
-HMODULE g_scannedModules[kMaxScannedModules]{};
-unsigned int g_scannedModuleCount = 0;
 
 void* __cdecl hookedNvApiQueryInterface(unsigned int interfaceId);
 
@@ -43,6 +41,12 @@ struct ImportPatchTarget
     void* targetProc = nullptr;
     void* replacement = nullptr;
     void** original = nullptr;
+};
+
+struct ModuleScanState
+{
+    std::vector<HMODULE> modules;
+    std::vector<HMODULE> scannedModules;
 };
 
 void cacheNvApiModule(HMODULE module)
@@ -63,24 +67,40 @@ void cachePointer(std::atomic<void*>& cache, void* value)
     cache.compare_exchange_strong(expected, value, std::memory_order_relaxed, std::memory_order_relaxed);
 }
 
-bool rememberModule(HMODULE module)
+bool moduleAddressLess(HMODULE left, HMODULE right)
 {
-    HMODULE* begin = g_scannedModules;
-    HMODULE* end = g_scannedModules + g_scannedModuleCount;
-    HMODULE* it = std::lower_bound(begin, end, module, [](HMODULE left, HMODULE right) {
-        return reinterpret_cast<std::uintptr_t>(left) < reinterpret_cast<std::uintptr_t>(right);
-    });
-    if (it != end && *it == module)
+    return reinterpret_cast<std::uintptr_t>(left) < reinterpret_cast<std::uintptr_t>(right);
+}
+
+bool rememberModule(ModuleScanState& state, HMODULE module)
+{
+    auto it = std::lower_bound(
+        state.scannedModules.begin(), state.scannedModules.end(), module, moduleAddressLess);
+    if (it != state.scannedModules.end() && *it == module)
         return false;
 
-    if (g_scannedModuleCount >= kMaxScannedModules)
-        return false;
-
-    std::move_backward(it, end, end + 1);
-    *it = module;
-    ++g_scannedModuleCount;
-
+    state.scannedModules.insert(it, module);
     return true;
+}
+
+void forgetUnloadedModules(ModuleScanState& state, std::size_t moduleCount)
+{
+    const auto liveBegin = state.modules.begin();
+    const auto liveEnd = liveBegin + moduleCount;
+
+    HMODULE nvapiModule = g_nvapiModule.load(std::memory_order_relaxed);
+    if (nvapiModule && !std::binary_search(liveBegin, liveEnd, nvapiModule, moduleAddressLess))
+    {
+        g_realNvApiQueryInterface.store(nullptr, std::memory_order_release);
+        g_nvapiModule.store(nullptr, std::memory_order_relaxed);
+    }
+
+    const auto firstUnloaded = std::remove_if(
+        state.scannedModules.begin(), state.scannedModules.end(),
+        [liveBegin, liveEnd](HMODULE module) {
+            return !std::binary_search(liveBegin, liveEnd, module, moduleAddressLess);
+        });
+    state.scannedModules.erase(firstUnloaded, state.scannedModules.end());
 }
 
 void storeRealNvApiQueryInterfaceIfUnset(NvApiQueryInterface queryInterface)
@@ -272,10 +292,11 @@ void patchMatchingThunks(const PeImageView& image, IMAGE_IMPORT_DESCRIPTOR* desc
     if (!thunk)
         return;
 
-    const DWORD thunkCapacity = (image.size - desc->FirstThunk) / sizeof(IMAGE_THUNK_DATA);
+    const DWORD thunkCapacity = static_cast<DWORD>(
+        (image.size - desc->FirstThunk) / sizeof(IMAGE_THUNK_DATA));
     const DWORD maxThunks = thunkCapacity < 4096 ? thunkCapacity : 4096;
     const DWORD maxOrigThunks = origThunk && desc->OriginalFirstThunk < image.size
-        ? (image.size - desc->OriginalFirstThunk) / sizeof(IMAGE_THUNK_DATA)
+        ? static_cast<DWORD>((image.size - desc->OriginalFirstThunk) / sizeof(IMAGE_THUNK_DATA))
         : 0;
 
     for (DWORD thunkIndex = 0; thunkIndex < maxThunks && thunk->u1.Function; ++thunkIndex, ++thunk)
@@ -316,7 +337,8 @@ void patchModuleImportsUnsafe(HMODULE module)
     GetProcAddressFn realGetProcAddress = g_realGetProcAddress.load(std::memory_order_relaxed);
     void* originalNvQuery = nullptr;
 
-    const DWORD maxDescriptors = importDir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    const DWORD maxDescriptors = static_cast<DWORD>(
+        importDir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR));
     auto* desc = rvaToPtr<IMAGE_IMPORT_DESCRIPTOR>(image, importDir.VirtualAddress);
     for (DWORD descIndex = 0; desc && descIndex < maxDescriptors && desc->Name; ++descIndex, ++desc)
     {
@@ -357,40 +379,97 @@ EnumProcessModulesFn enumProcessModulesFn()
     return fn;
 }
 
-void scanAndPatchImports()
+bool enumerateProcessModules(ModuleScanState& state, std::size_t& moduleCount)
 {
-    seedRealNvApiQueryInterface();
-
     EnumProcessModulesFn enumModules = enumProcessModulesFn();
     if (!enumModules)
-        return;
+        return false;
 
-    HMODULE modules[kMaxScannedModules];
-    DWORD bytesNeeded = 0;
-    if (!enumModules(GetCurrentProcess(), modules, sizeof(modules), &bytesNeeded))
-        return;
+    if (state.modules.empty())
+        state.modules.resize(kInitialModuleCapacity);
 
-    DWORD moduleCount = bytesNeeded / sizeof(HMODULE);
-    if (moduleCount > kMaxScannedModules)
-        moduleCount = kMaxScannedModules;
-
-    for (DWORD i = 0; i < moduleCount; ++i)
+    for (;;)
     {
-        if (rememberModule(modules[i]))
-            patchModuleImports(modules[i]);
+        const std::size_t bufferBytes = state.modules.size() * sizeof(HMODULE);
+        if (bufferBytes > MAXDWORD)
+            return false;
+
+        DWORD bytesNeeded = 0;
+        if (!enumModules(
+            GetCurrentProcess(),
+            state.modules.data(),
+            static_cast<DWORD>(bufferBytes),
+            &bytesNeeded))
+        {
+            return false;
+        }
+
+        const std::size_t requiredModules =
+            (static_cast<std::size_t>(bytesNeeded) + sizeof(HMODULE) - 1) / sizeof(HMODULE);
+        if (requiredModules <= state.modules.size())
+        {
+            moduleCount = requiredModules;
+            return true;
+        }
+
+        state.modules.resize(requiredModules);
     }
 }
 
-DWORD WINAPI workerThread(void*)
+void scanAndPatchImports(ModuleScanState& state)
 {
-    for (int i = 0; g_running.load(std::memory_order_relaxed) && i < kModuleScanIterations; ++i)
+    seedRealNvApiQueryInterface();
+
+    std::size_t moduleCount = 0;
+    if (!enumerateProcessModules(state, moduleCount))
+        return;
+
+    auto liveEnd = state.modules.begin() + moduleCount;
+    std::sort(state.modules.begin(), liveEnd, moduleAddressLess);
+    forgetUnloadedModules(state, moduleCount);
+    if (state.scannedModules.capacity() < state.modules.size())
+        state.scannedModules.reserve(state.modules.size());
+
+    for (auto it = state.modules.begin(); it != liveEnd; ++it)
     {
-        scanAndPatchImports();
-        if (i + 1 < kModuleScanIterations && g_running.load(std::memory_order_relaxed))
-            Sleep(kModuleScanIntervalMs);
+        if (rememberModule(state, *it))
+            patchModuleImports(*it);
+    }
+}
+
+DWORD workerThreadMain()
+{
+    ModuleScanState state;
+    state.modules.resize(kInitialModuleCapacity);
+    state.scannedModules.reserve(kInitialModuleCapacity);
+
+    if (g_running.load(std::memory_order_relaxed))
+        scanAndPatchImports(state);
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (int i = 1; g_running.load(std::memory_order_relaxed) && i < kModuleScanIterations; ++i)
+    {
+        Sleep(kModuleScanIntervalMs);
+        if (g_running.load(std::memory_order_relaxed))
+            scanAndPatchImports(state);
     }
 
     return 0;
+}
+
+DWORD WINAPI workerThread(void*) noexcept
+{
+    try
+    {
+        return workerThreadMain();
+    }
+    catch (...)
+    {
+#ifdef _DEBUG
+        OutputDebugStringW(L"FlipConfigPayload: worker stopped after allocation failure.\n");
+#endif
+        return 0;
+    }
 }
 }
 

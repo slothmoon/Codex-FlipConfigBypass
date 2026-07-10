@@ -12,11 +12,14 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "resource.h"
+
+static_assert(sizeof(void*) == 8, "FlipConfigBypass must be built as x64.");
 
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 reinterpret_cast<DPI_AWARENESS_CONTEXT>(-4)
@@ -63,7 +66,7 @@ std::unordered_set<std::wstring> g_whitelistPaths;
 std::unordered_set<std::wstring> g_whitelistPathNames;
 bool g_hasPathWhitelist = false;
 // Owned by watcherLoop only; add synchronization before touching this from UI code.
-std::unordered_set<DWORD> g_attemptedPids;
+std::unordered_map<DWORD, ULONGLONG> g_attemptedProcesses;
 std::wstring g_exePath;
 std::wstring g_exeDir;
 std::wstring g_payloadPath;
@@ -185,7 +188,7 @@ std::string wideToUtf8(const std::wstring& text)
         return {};
 
     const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-    std::string result(size, '\0');
+    std::string result(static_cast<size_t>(size), '\0');
     WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr);
     return result;
 }
@@ -210,7 +213,7 @@ std::wstring utf8ToWide(const std::string& text)
     if (size <= 0)
         return {};
 
-    std::wstring result(size, L'\0');
+    std::wstring result(static_cast<size_t>(size), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, data, byteCount, result.data(), size);
     return result;
 }
@@ -246,16 +249,19 @@ bool writeTextFile(const std::wstring& path, const std::wstring& text)
     DWORD written = 0;
     const BOOL ok = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
     CloseHandle(file);
-    return ok && written == bytes.size();
+    return ok && static_cast<size_t>(written) == bytes.size();
 }
 
 void appendLog(const std::wstring& message)
 {
-    SYSTEMTIME time{};
-    GetLocalTime(&time);
+    SYSTEMTIME localTime{};
+    GetLocalTime(&localTime);
 
     wchar_t prefix[32]{};
-    swprintf_s(prefix, L"[%02u:%02u:%02u] ", time.wHour, time.wMinute, time.wSecond);
+    swprintf_s(prefix, L"[%02u:%02u:%02u] ",
+        static_cast<unsigned int>(localTime.wHour),
+        static_cast<unsigned int>(localTime.wMinute),
+        static_cast<unsigned int>(localTime.wSecond));
 
     std::wstring line = prefix;
     line += message;
@@ -364,30 +370,44 @@ WhitelistMatchSnapshot whitelistMatchSnapshot()
     return { g_whitelistNames, g_whitelistPaths, g_whitelistPathNames, g_hasPathWhitelist };
 }
 
-bool pidWasAttempted(DWORD pid)
+constexpr ULONGLONG kUnknownProcessCreationTime = 0;
+
+bool processInstanceWasAttempted(DWORD pid, ULONGLONG creationTime)
 {
-    return g_attemptedPids.find(pid) != g_attemptedPids.end();
+    const auto it = g_attemptedProcesses.find(pid);
+    return it != g_attemptedProcesses.end() &&
+        (it->second == kUnknownProcessCreationTime || it->second == creationTime);
 }
 
-bool hasAttemptedPids()
+bool pidHasUnknownAttempt(DWORD pid)
 {
-    return !g_attemptedPids.empty();
+    const auto it = g_attemptedProcesses.find(pid);
+    return it != g_attemptedProcesses.end() && it->second == kUnknownProcessCreationTime;
 }
 
-void markPidAttempted(DWORD pid)
+bool hasAttemptedProcesses()
 {
-    g_attemptedPids.insert(pid);
+    return !g_attemptedProcesses.empty();
+}
+
+void markProcessAttempted(DWORD pid, ULONGLONG creationTime)
+{
+    g_attemptedProcesses[pid] = creationTime;
 }
 
 std::unordered_set<DWORD> attemptedPidsSnapshot()
 {
-    return g_attemptedPids;
+    std::unordered_set<DWORD> pids;
+    pids.reserve(g_attemptedProcesses.size());
+    for (const auto& attempted : g_attemptedProcesses)
+        pids.insert(attempted.first);
+    return pids;
 }
 
-void removeAttemptedPids(const std::unordered_set<DWORD>& pids)
+void removeAttemptedProcesses(const std::unordered_set<DWORD>& pids)
 {
     for (DWORD pid : pids)
-        g_attemptedPids.erase(pid);
+        g_attemptedProcesses.erase(pid);
 }
 
 bool matchesWhitelistedPath(const WhitelistMatchSnapshot& whitelist, const std::wstring& fullPath)
@@ -398,43 +418,87 @@ bool matchesWhitelistedPath(const WhitelistMatchSnapshot& whitelist, const std::
     return whitelist.paths.find(normalizeWhitelistValue(fullPath)) != whitelist.paths.end();
 }
 
-std::wstring processPath(DWORD pid)
+struct ProcessMetadata
+{
+    std::wstring fullPath;
+    ULONGLONG creationTime = kUnknownProcessCreationTime;
+};
+
+bool queryProcessMetadata(DWORD pid, bool includePath, ProcessMetadata& metadata)
 {
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process)
-        return {};
+        return false;
 
-    wchar_t path[MAX_PATH * 4]{};
-    DWORD size = static_cast<DWORD>(std::size(path));
-    std::wstring result;
-    if (QueryFullProcessImageNameW(process, 0, path, &size))
-        result.assign(path, size);
+    FILETIME creation{};
+    FILETIME exitTime{};
+    FILETIME kernelTime{};
+    FILETIME userTime{};
+    bool ok = GetProcessTimes(process, &creation, &exitTime, &kernelTime, &userTime) == TRUE;
+    if (ok)
+    {
+        ULARGE_INTEGER value{};
+        value.LowPart = creation.dwLowDateTime;
+        value.HighPart = creation.dwHighDateTime;
+        metadata.creationTime = value.QuadPart;
+    }
+
+    if (ok && includePath)
+    {
+        wchar_t path[MAX_PATH * 4]{};
+        DWORD size = static_cast<DWORD>(std::size(path));
+        ok = QueryFullProcessImageNameW(process, 0, path, &size) == TRUE;
+        if (ok)
+            metadata.fullPath.assign(path, size);
+    }
 
     CloseHandle(process);
-    return result;
+    return ok;
 }
 
-bool isWow64ProcessCompat(HANDLE process, bool& isWow64)
-{
-    isWow64 = false;
-    using IsWow64Process2Fn = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
-    auto isWow64Process2 = reinterpret_cast<IsWow64Process2Fn>(
-        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2"));
+using IsWow64Process2Fn = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
 
+IsWow64Process2Fn isWow64Process2Fn()
+{
+    static const auto fn = reinterpret_cast<IsWow64Process2Fn>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2"));
+    return fn;
+}
+
+bool supportedX64Host()
+{
+    IsWow64Process2Fn isWow64Process2 = isWow64Process2Fn();
+    if (!isWow64Process2)
+        return true;
+
+    USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    return isWow64Process2(GetCurrentProcess(), &processMachine, &nativeMachine) &&
+        nativeMachine == IMAGE_FILE_MACHINE_AMD64;
+}
+
+bool isX64ProcessCompat(HANDLE process, bool& isX64)
+{
+    isX64 = false;
+    IsWow64Process2Fn isWow64Process2 = isWow64Process2Fn();
     if (isWow64Process2)
     {
-        USHORT processMachine = 0;
-        USHORT nativeMachine = 0;
+        USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+        USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
         if (!isWow64Process2(process, &processMachine, &nativeMachine))
             return false;
-        isWow64 = processMachine != IMAGE_FILE_MACHINE_UNKNOWN;
+
+        const USHORT effectiveMachine = processMachine == IMAGE_FILE_MACHINE_UNKNOWN
+            ? nativeMachine
+            : processMachine;
+        isX64 = effectiveMachine == IMAGE_FILE_MACHINE_AMD64;
         return true;
     }
 
     BOOL wow64 = FALSE;
     if (!IsWow64Process(process, &wow64))
         return false;
-    isWow64 = wow64 == TRUE;
+    isX64 = wow64 == FALSE;
     return true;
 }
 
@@ -474,15 +538,15 @@ bool injectPayload(DWORD pid, const std::wstring& exeName)
         return false;
     }
 
-    bool isWow64 = false;
-    if (!isWow64ProcessCompat(process, isWow64))
+    bool isX64 = false;
+    if (!isX64ProcessCompat(process, isX64))
     {
         CloseHandle(process);
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, could not verify architecture");
         return false;
     }
 
-    if (isWow64)
+    if (!isX64)
     {
         CloseHandle(process);
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, payload architecture mismatch");
@@ -498,38 +562,64 @@ bool injectPayload(DWORD pid, const std::wstring& exeName)
         return false;
     }
 
-    bool ok = WriteProcessMemory(process, remotePath, g_payloadPath.c_str(), bytes, nullptr) == TRUE;
+    bool ok = false;
+    bool remotePathMayBeInUse = false;
     bool remoteThreadTimedOut = false;
-    if (ok)
+    bool remoteThreadWaitFailed = false;
+    DWORD error = ERROR_SUCCESS;
+    if (!WriteProcessMemory(process, remotePath, g_payloadPath.c_str(), bytes, nullptr))
+    {
+        error = GetLastError();
+    }
+    else
     {
         auto loadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
-        HANDLE thread = CreateRemoteThread(process, nullptr, 0, loadLibrary, remotePath, 0, nullptr);
-        if (thread)
+        if (!loadLibrary)
         {
-            const DWORD waitResult = WaitForSingleObject(thread, 10000);
-            DWORD exitCode = 0;
-            GetExitCodeThread(thread, &exitCode);
-            ok = waitResult == WAIT_OBJECT_0 && exitCode != 0;
-            remoteThreadTimedOut = waitResult == WAIT_TIMEOUT;
-            CloseHandle(thread);
-            if (!ok)
-                SetLastError(remoteThreadTimedOut ? WAIT_TIMEOUT : ERROR_DLL_INIT_FAILED);
+            error = ERROR_PROC_NOT_FOUND;
         }
         else
         {
-            ok = false;
+            HANDLE thread = CreateRemoteThread(process, nullptr, 0, loadLibrary, remotePath, 0, nullptr);
+            if (!thread)
+            {
+                error = GetLastError();
+            }
+            else
+            {
+                const DWORD waitResult = WaitForSingleObject(thread, 10000);
+                if (waitResult == WAIT_OBJECT_0)
+                {
+                    DWORD exitCode = 0;
+                    if (!GetExitCodeThread(thread, &exitCode))
+                        error = GetLastError();
+                    else if (!exitCode)
+                        error = ERROR_DLL_INIT_FAILED;
+                    else
+                        ok = true;
+                }
+                else
+                {
+                    remotePathMayBeInUse = true;
+                    remoteThreadTimedOut = waitResult == WAIT_TIMEOUT;
+                    remoteThreadWaitFailed = !remoteThreadTimedOut;
+                    error = remoteThreadTimedOut ? WAIT_TIMEOUT : GetLastError();
+                    if (remoteThreadWaitFailed && error == ERROR_SUCCESS)
+                        error = ERROR_GEN_FAILURE;
+                }
+                CloseHandle(thread);
+            }
         }
     }
 
-    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
-    if (!remoteThreadTimedOut)
+    if (!remotePathMayBeInUse)
     {
         VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
     }
     else
     {
-        // LoadLibraryW may still be reading remotePath after timeout; leave it allocated rather than racing the target.
+        // The remote thread may still be reading remotePath; leave it allocated rather than racing the target.
     }
     CloseHandle(process);
 
@@ -537,6 +627,8 @@ bool injectPayload(DWORD pid, const std::wstring& exeName)
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - injected OK");
     else if (remoteThreadTimedOut)
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, remote thread timed out; remote path cleanup skipped");
+    else if (remoteThreadWaitFailed)
+        appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, remote thread wait failed; remote path cleanup skipped, " + lastErrorText(error));
     else
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, " + lastErrorText(error));
 
@@ -545,12 +637,14 @@ bool injectPayload(DWORD pid, const std::wstring& exeName)
 
 void watcherLoop()
 {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
     while (g_running.load(std::memory_order_relaxed))
     {
         if (!g_paused.load(std::memory_order_relaxed))
         {
             const WhitelistMatchSnapshot whitelist = whitelistMatchSnapshot();
-            const bool shouldPruneAttemptedPids = hasAttemptedPids();
+            const bool shouldPruneAttemptedPids = hasAttemptedProcesses();
             const bool hasWhitelistEntries = !whitelist.names.empty() || whitelist.hasPathEntries;
             if (hasWhitelistEntries || shouldPruneAttemptedPids)
             {
@@ -562,7 +656,7 @@ void watcherLoop()
                 if (snapshot != INVALID_HANDLE_VALUE)
                 {
                     PROCESSENTRY32W entry{};
-                    entry.dwSize = sizeof(entry);
+                    entry.dwSize = static_cast<DWORD>(sizeof(entry));
                     if (Process32FirstW(snapshot, &entry))
                     {
                         do
@@ -571,30 +665,45 @@ void watcherLoop()
                             if (shouldPruneAttemptedPids)
                                 missingAttemptedPids.erase(pid);
 
-                            if (!hasWhitelistEntries || pidWasAttempted(pid))
+                            if (!hasWhitelistEntries)
                                 continue;
 
                             const std::wstring exeName = entry.szExeFile;
-                            std::wstring fullPath;
                             const std::wstring exeLower = toLower(exeName);
                             const bool nameMatched = whitelist.names.find(exeLower) != whitelist.names.end();
-                            if (!nameMatched && whitelist.hasPathEntries &&
-                                whitelist.pathNames.find(exeLower) != whitelist.pathNames.end())
+                            const bool pathNameMatched = !nameMatched && whitelist.hasPathEntries &&
+                                whitelist.pathNames.find(exeLower) != whitelist.pathNames.end();
+                            if (!nameMatched && !pathNameMatched)
+                                continue;
+
+                            if (pidHasUnknownAttempt(pid))
+                                continue;
+
+                            ProcessMetadata metadata{};
+                            if (!queryProcessMetadata(pid, pathNameMatched, metadata))
                             {
-                                fullPath = processPath(pid);
+                                if (nameMatched)
+                                {
+                                    markProcessAttempted(pid, kUnknownProcessCreationTime);
+                                    appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, could not identify process instance");
+                                }
+                                continue;
                             }
 
-                            if (nameMatched || matchesWhitelistedPath(whitelist, fullPath))
-                            {
-                                markPidAttempted(pid);
-                                injectPayload(pid, exeName);
-                            }
+                            if (processInstanceWasAttempted(pid, metadata.creationTime))
+                                continue;
+
+                            if (!nameMatched && !matchesWhitelistedPath(whitelist, metadata.fullPath))
+                                continue;
+
+                            markProcessAttempted(pid, metadata.creationTime);
+                            injectPayload(pid, exeName);
                         } while (Process32NextW(snapshot, &entry));
                     }
 
                     CloseHandle(snapshot);
                     if (shouldPruneAttemptedPids)
-                        removeAttemptedPids(missingAttemptedPids);
+                        removeAttemptedProcesses(missingAttemptedPids);
                 }
             }
         }
@@ -619,7 +728,7 @@ bool startWithWindowsEnabled()
 
     wchar_t value[MAX_PATH * 4]{};
     DWORD type = 0;
-    DWORD size = sizeof(value);
+    DWORD size = static_cast<DWORD>(sizeof(value));
     const LONG result = RegQueryValueExW(key, kRunValueName, nullptr, &type, reinterpret_cast<BYTE*>(value), &size);
     RegCloseKey(key);
 
@@ -705,9 +814,9 @@ bool saveWhitelistList(HWND list)
         if (len == LB_ERR)
             continue;
 
-        std::wstring item(len + 1, L'\0');
+        std::wstring item(static_cast<size_t>(len) + 1, L'\0');
         SendMessageW(list, LB_GETTEXT, i, reinterpret_cast<LPARAM>(item.data()));
-        item.resize(len);
+        item.resize(static_cast<size_t>(len));
         if (!content.empty())
             content += L"\r\n";
         content += item;
@@ -732,9 +841,9 @@ bool listContainsNormalizedEntry(HWND list, const std::wstring& entry)
         if (len == LB_ERR)
             continue;
 
-        std::wstring item(len + 1, L'\0');
+        std::wstring item(static_cast<size_t>(len) + 1, L'\0');
         SendMessageW(list, LB_GETTEXT, i, reinterpret_cast<LPARAM>(item.data()));
-        item.resize(len);
+        item.resize(static_cast<size_t>(len));
         if (normalizeWhitelistValue(item) == normalizedEntry)
             return true;
     }
@@ -748,9 +857,9 @@ void addEntryFromEdit(EditorState* state)
     if (len <= 0)
         return;
 
-    std::wstring item(len + 1, L'\0');
+    std::wstring item(static_cast<size_t>(len) + 1, L'\0');
     GetWindowTextW(state->entry, item.data(), len + 1);
-    item.resize(len);
+    item.resize(static_cast<size_t>(len));
     item = trim(item);
     if (item.empty())
         return;
@@ -808,7 +917,7 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         {
             wchar_t file[MAX_PATH * 4]{};
             OPENFILENAMEW ofn{};
-            ofn.lStructSize = sizeof(ofn);
+            ofn.lStructSize = static_cast<DWORD>(sizeof(ofn));
             ofn.hwndOwner = hwnd;
             ofn.lpstrFilter = L"Executable Files (*.exe)\0*.exe\0All Files (*.*)\0*.*\0";
             ofn.lpstrFile = file;
@@ -935,7 +1044,7 @@ void showTrayMenu(HWND hwnd)
 
 void addTrayIcon(HWND hwnd)
 {
-    g_tray.cbSize = sizeof(g_tray);
+    g_tray.cbSize = static_cast<DWORD>(sizeof(g_tray));
     g_tray.hWnd = hwnd;
     g_tray.uID = 1;
     g_tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
@@ -1027,7 +1136,7 @@ bool initPaths()
 {
     wchar_t path[MAX_PATH * 4]{};
     const DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
-    if (length == 0 || length >= std::size(path))
+    if (length == 0 || static_cast<size_t>(length) >= std::size(path))
         return false;
 
     g_exePath.assign(path, length);
@@ -1081,6 +1190,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     enableDpiAwareness();
     g_dpi = systemDpi();
     g_instance = instance;
+    if (!supportedX64Host())
+    {
+        MessageBoxW(nullptr,
+            L"Flip Config Bypass supports only native x64 Windows. ARM64 hosts are not supported.",
+            L"Flip Config Bypass",
+            MB_ICONERROR | MB_OK);
+        return 1;
+    }
     if (!initPaths())
         return 1;
     if (!acquireSingleInstance())
