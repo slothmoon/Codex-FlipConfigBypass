@@ -1185,8 +1185,8 @@ void showTrayMenu(HWND hwnd)
     const bool paused = g_paused.load(std::memory_order_relaxed);
     const bool gameActive = activeProcessRunning();
     const std::wstring status = gameActive
-        ? L"Game active - scanning stopped"
-        : (paused ? L"Paused - " : L"Running - ") + std::to_wstring(watched) + L" apps watched";
+        ? L"Game active"
+        : paused ? L"Paused" : L"Watching " + std::to_wstring(watched) + L" apps";
 
     AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"Flip Config Bypass");
     AppendMenuW(menu, MF_STRING | MF_DISABLED | (!paused && !gameActive ? MF_CHECKED : 0), 0, status.c_str());
