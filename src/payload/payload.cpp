@@ -39,6 +39,7 @@ struct ImportPatchTarget
 {
     const char* procName = nullptr;
     void* targetProc = nullptr;
+    void* alternateTargetProc = nullptr;
     void* replacement = nullptr;
     void** original = nullptr;
 };
@@ -224,22 +225,31 @@ bool patchThunk(IMAGE_THUNK_DATA* thunk, void* replacement, void** original)
     return true;
 }
 
+bool isApiSetDllName(const char* dllName)
+{
+    return _strnicmp(dllName, "api-", 4) == 0 || _strnicmp(dllName, "ext-", 4) == 0;
+}
+
+bool targetProcMatches(const ImportPatchTarget& target, void* proc)
+{
+    return proc && (proc == target.targetProc || proc == target.alternateTargetProc);
+}
+
 bool importPatchTargetForDll(const char* dllName, GetProcAddressFn realGetProcAddress, void*& originalNvQuery, ImportPatchTarget& target)
 {
-    if (_stricmp(dllName, "KERNEL32.dll") == 0)
+    if (_stricmp(dllName, "KERNEL32.dll") == 0 ||
+        _stricmp(dllName, "KERNELBASE.dll") == 0 ||
+        isApiSetDllName(dllName))
     {
         target.procName = "GetProcAddress";
-        target.targetProc = cachedProcAddressFrom(g_kernel32GetProcAddress, "KERNEL32.dll", "GetProcAddress", realGetProcAddress);
+        target.targetProc = cachedProcAddressFrom(
+            g_kernel32GetProcAddress, "KERNEL32.dll", "GetProcAddress", realGetProcAddress);
+        target.alternateTargetProc = cachedProcAddressFrom(
+            g_kernelbaseGetProcAddress, "KERNELBASE.dll", "GetProcAddress", realGetProcAddress);
+        if (target.alternateTargetProc == target.targetProc)
+            target.alternateTargetProc = nullptr;
         target.replacement = reinterpret_cast<void*>(&hookedGetProcAddress);
-        return true;
-    }
-
-    if (_stricmp(dllName, "KERNELBASE.dll") == 0)
-    {
-        target.procName = "GetProcAddress";
-        target.targetProc = cachedProcAddressFrom(g_kernelbaseGetProcAddress, "KERNELBASE.dll", "GetProcAddress", realGetProcAddress);
-        target.replacement = reinterpret_cast<void*>(&hookedGetProcAddress);
-        return true;
+        return target.targetProc || target.alternateTargetProc;
     }
 
     if (_stricmp(dllName, "nvapi64.dll") == 0)
@@ -277,13 +287,13 @@ void patchMatchingThunks(const PeImageView& image, IMAGE_IMPORT_DESCRIPTOR* desc
             !IMAGE_SNAP_BY_ORDINAL(origThunk[thunkIndex].u1.Ordinal))
         {
             auto* importByName = rvaToPtr<IMAGE_IMPORT_BY_NAME>(image, static_cast<DWORD>(origThunk[thunkIndex].u1.AddressOfData));
-            shouldPatch = importByName && target.targetProc &&
-                reinterpret_cast<void*>(thunk->u1.Function) == target.targetProc &&
+            shouldPatch = importByName &&
+                targetProcMatches(target, reinterpret_cast<void*>(thunk->u1.Function)) &&
                 std::strcmp(reinterpret_cast<const char*>(importByName->Name), target.procName) == 0;
         }
-        else if (target.targetProc)
+        else
         {
-            shouldPatch = reinterpret_cast<void*>(thunk->u1.Function) == target.targetProc;
+            shouldPatch = targetProcMatches(target, reinterpret_cast<void*>(thunk->u1.Function));
         }
 
         if (shouldPatch)
@@ -461,12 +471,10 @@ DWORD WINAPI workerThread(void*) noexcept
 }
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void*)
+BOOL APIENTRY DllMain(HMODULE, DWORD reason, void*)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
-        DisableThreadLibraryCalls(module);
-
         HMODULE pinned = nullptr;
         if (!GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,

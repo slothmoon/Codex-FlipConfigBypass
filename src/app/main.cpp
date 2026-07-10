@@ -25,10 +25,6 @@ static_assert(sizeof(void*) == 8, "FlipConfigBypass must be built as x64.");
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 reinterpret_cast<DPI_AWARENESS_CONTEXT>(-4)
 #endif
 
-#ifndef EM_SETCUEBANNER
-#define EM_SETCUEBANNER 0x1501
-#endif
-
 namespace
 {
 constexpr UINT kTrayMessage = WM_APP + 1;
@@ -436,24 +432,29 @@ struct ProcessMetadata
     ULONGLONG creationTime = kUnknownProcessCreationTime;
 };
 
+bool queryProcessCreationTime(HANDLE process, ULONGLONG& creationTime)
+{
+    FILETIME creation{};
+    FILETIME exitTime{};
+    FILETIME kernelTime{};
+    FILETIME userTime{};
+    if (!GetProcessTimes(process, &creation, &exitTime, &kernelTime, &userTime))
+        return false;
+
+    ULARGE_INTEGER value{};
+    value.LowPart = creation.dwLowDateTime;
+    value.HighPart = creation.dwHighDateTime;
+    creationTime = value.QuadPart;
+    return true;
+}
+
 bool queryProcessMetadata(DWORD pid, bool includePath, ProcessMetadata& metadata)
 {
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process)
         return false;
 
-    FILETIME creation{};
-    FILETIME exitTime{};
-    FILETIME kernelTime{};
-    FILETIME userTime{};
-    bool ok = GetProcessTimes(process, &creation, &exitTime, &kernelTime, &userTime) == TRUE;
-    if (ok)
-    {
-        ULARGE_INTEGER value{};
-        value.LowPart = creation.dwLowDateTime;
-        value.HighPart = creation.dwHighDateTime;
-        metadata.creationTime = value.QuadPart;
-    }
+    bool ok = queryProcessCreationTime(process, metadata.creationTime);
 
     if (ok && includePath)
     {
@@ -532,7 +533,7 @@ std::wstring lastErrorText(DWORD error)
     return text;
 }
 
-bool injectPayload(DWORD pid, const std::wstring& exeName)
+bool injectPayload(DWORD pid, ULONGLONG expectedCreationTime, const std::wstring& exeName)
 {
     if (GetFileAttributesW(g_payloadPath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
@@ -547,6 +548,21 @@ bool injectPayload(DWORD pid, const std::wstring& exeName)
     if (!process)
     {
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, " + lastErrorText(GetLastError()));
+        return false;
+    }
+
+    ULONGLONG actualCreationTime = kUnknownProcessCreationTime;
+    if (!queryProcessCreationTime(process, actualCreationTime))
+    {
+        CloseHandle(process);
+        appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, could not revalidate process instance");
+        return false;
+    }
+
+    if (actualCreationTime != expectedCreationTime)
+    {
+        CloseHandle(process);
+        appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, process instance changed before injection");
         return false;
     }
 
@@ -649,8 +665,6 @@ bool injectPayload(DWORD pid, const std::wstring& exeName)
 
 void watcherLoop()
 {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-
     WhitelistMatchSnapshot whitelist;
     std::uint64_t whitelistVersion = 0;
 
@@ -713,7 +727,7 @@ void watcherLoop()
 
                             const std::wstring exeName = entry.szExeFile;
                             markProcessAttempted(pid, metadata.creationTime);
-                            injectPayload(pid, exeName);
+                            injectPayload(pid, metadata.creationTime, exeName);
                         } while (Process32NextW(snapshot, &entry));
                     }
 
@@ -907,7 +921,6 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
             0, 0, 0, 0, hwnd, menuId(kIdEntry), g_instance, nullptr);
         setFont(state->entry);
-        SendMessageW(state->entry, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"Example: 007FirstLight.exe"));
         state->list = CreateWindowExW(0, L"LISTBOX", nullptr,
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             0, 0, 0, 0, hwnd, nullptr, g_instance, nullptr);
