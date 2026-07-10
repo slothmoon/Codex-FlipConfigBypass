@@ -15,6 +15,7 @@ Everything else is intentionally left alone.
 - Watches only executables listed in `whitelist.txt`
 - Injects only into x64 processes
 - Attempts each matching process instance only once
+- Stops process scanning while a successfully injected game is running
 - Hooks `nvapi64.dll!nvapi_QueryInterface`
 - Returns `nullptr` only for `0xF3148C42`
 - Forwards all other NVAPI query IDs to the real NVAPI function
@@ -146,6 +147,7 @@ Avoid broad exclusions for a whole detection name.
 - NVAPI pointers resolved before injection may stay cached and unaffected
 - Modules loaded after the payload scan window may not be patched
 - A failed injection is not retried for the same process instance
+- While an injected game is running, additional whitelisted processes are not detected
 
 ## Build
 

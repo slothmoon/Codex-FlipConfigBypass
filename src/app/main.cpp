@@ -11,9 +11,9 @@
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,12 +58,17 @@ std::thread g_watcherThread;
 std::mutex g_stateMutex;
 std::atomic<std::uint64_t> g_whitelistVersion{ 1 };
 std::vector<std::wstring> g_whitelist;
-std::unordered_set<std::wstring> g_whitelistNames;
-std::unordered_set<std::wstring> g_whitelistPaths;
-std::unordered_set<std::wstring> g_whitelistPathNames;
+std::vector<std::wstring> g_whitelistNames;
+std::vector<std::wstring> g_whitelistPaths;
+std::vector<std::wstring> g_whitelistPathNames;
 bool g_hasPathWhitelist = false;
 // Owned by watcherLoop only; add synchronization before touching this from UI code.
-std::unordered_map<DWORD, ULONGLONG> g_attemptedProcesses;
+struct AttemptedProcess
+{
+    ULONGLONG creationTime = 0;
+    std::uint64_t lastSeenGeneration = 0;
+};
+std::unordered_map<DWORD, AttemptedProcess> g_attemptedProcesses;
 std::wstring g_exePath;
 std::wstring g_exeDir;
 std::wstring g_payloadPath;
@@ -303,9 +308,9 @@ void ensureDefaultFiles()
 void loadWhitelist()
 {
     std::vector<std::wstring> entries;
-    std::unordered_set<std::wstring> names;
-    std::unordered_set<std::wstring> paths;
-    std::unordered_set<std::wstring> pathNames;
+    std::vector<std::wstring> names;
+    std::vector<std::wstring> paths;
+    std::vector<std::wstring> pathNames;
     std::wstring content = readTextFile(g_whitelistPath);
     size_t start = 0;
     while (start <= content.size())
@@ -317,18 +322,22 @@ void loadWhitelist()
             std::wstring normalized = normalizeWhitelistValue(line);
             if (isPathEntry(normalized))
             {
-                if (paths.insert(normalized).second)
+                if (std::find(paths.begin(), paths.end(), normalized) == paths.end())
                 {
                     std::wstring pathName = fileNameFromPath(normalized);
                     if (!pathName.empty())
-                        pathNames.insert(std::move(pathName));
+                        pathNames.push_back(std::move(pathName));
+                    paths.push_back(std::move(normalized));
                     entries.push_back(line);
                 }
             }
             else
             {
-                if (names.insert(normalized).second)
+                if (std::find(names.begin(), names.end(), normalized) == names.end())
+                {
+                    names.push_back(std::move(normalized));
                     entries.push_back(line);
+                }
             }
         }
 
@@ -338,6 +347,17 @@ void loadWhitelist()
         if (start == std::wstring::npos)
             break;
     }
+
+    const auto ordinalLess = [](const std::wstring& left, const std::wstring& right)
+    {
+        return CompareStringOrdinal(
+            left.data(), static_cast<int>(left.size()),
+            right.data(), static_cast<int>(right.size()), TRUE) == CSTR_LESS_THAN;
+    };
+    std::sort(names.begin(), names.end(), ordinalLess);
+    std::sort(paths.begin(), paths.end(), ordinalLess);
+    std::sort(pathNames.begin(), pathNames.end(), ordinalLess);
+    pathNames.erase(std::unique(pathNames.begin(), pathNames.end()), pathNames.end());
 
     std::lock_guard<std::mutex> lock(g_stateMutex);
     g_whitelist = std::move(entries);
@@ -356,9 +376,9 @@ std::vector<std::wstring> whitelistSnapshot()
 
 struct WhitelistMatchSnapshot
 {
-    std::unordered_set<std::wstring> names;
-    std::unordered_set<std::wstring> paths;
-    std::unordered_set<std::wstring> pathNames;
+    std::vector<std::wstring> names;
+    std::vector<std::wstring> paths;
+    std::vector<std::wstring> pathNames;
     bool hasPathEntries = false;
 };
 
@@ -380,17 +400,35 @@ void refreshWhitelistMatchSnapshot(
 
 constexpr ULONGLONG kUnknownProcessCreationTime = 0;
 
+int compareOrdinalIgnoreCase(std::wstring_view left, std::wstring_view right)
+{
+    return CompareStringOrdinal(
+        left.data(), static_cast<int>(left.size()),
+        right.data(), static_cast<int>(right.size()), TRUE);
+}
+
+bool containsOrdinalIgnoreCase(const std::vector<std::wstring>& values, std::wstring_view value)
+{
+    const auto it = std::lower_bound(
+        values.begin(), values.end(), value,
+        [](const std::wstring& stored, std::wstring_view candidate)
+        {
+            return compareOrdinalIgnoreCase(stored, candidate) == CSTR_LESS_THAN;
+        });
+    return it != values.end() && compareOrdinalIgnoreCase(*it, value) == CSTR_EQUAL;
+}
+
 bool processInstanceWasAttempted(DWORD pid, ULONGLONG creationTime)
 {
     const auto it = g_attemptedProcesses.find(pid);
     return it != g_attemptedProcesses.end() &&
-        (it->second == kUnknownProcessCreationTime || it->second == creationTime);
+        (it->second.creationTime == kUnknownProcessCreationTime || it->second.creationTime == creationTime);
 }
 
 bool pidHasUnknownAttempt(DWORD pid)
 {
     const auto it = g_attemptedProcesses.find(pid);
-    return it != g_attemptedProcesses.end() && it->second == kUnknownProcessCreationTime;
+    return it != g_attemptedProcesses.end() && it->second.creationTime == kUnknownProcessCreationTime;
 }
 
 bool hasAttemptedProcesses()
@@ -398,24 +436,27 @@ bool hasAttemptedProcesses()
     return !g_attemptedProcesses.empty();
 }
 
-void markProcessAttempted(DWORD pid, ULONGLONG creationTime)
+void markProcessSeen(DWORD pid, std::uint64_t generation)
 {
-    g_attemptedProcesses[pid] = creationTime;
+    const auto it = g_attemptedProcesses.find(pid);
+    if (it != g_attemptedProcesses.end())
+        it->second.lastSeenGeneration = generation;
 }
 
-std::unordered_set<DWORD> attemptedPidsSnapshot()
+void markProcessAttempted(DWORD pid, ULONGLONG creationTime, std::uint64_t generation)
 {
-    std::unordered_set<DWORD> pids;
-    pids.reserve(g_attemptedProcesses.size());
-    for (const auto& attempted : g_attemptedProcesses)
-        pids.insert(attempted.first);
-    return pids;
+    g_attemptedProcesses[pid] = { creationTime, generation };
 }
 
-void removeAttemptedProcesses(const std::unordered_set<DWORD>& pids)
+void removeUnseenAttemptedProcesses(std::uint64_t generation)
 {
-    for (DWORD pid : pids)
-        g_attemptedProcesses.erase(pid);
+    for (auto it = g_attemptedProcesses.begin(); it != g_attemptedProcesses.end();)
+    {
+        if (it->second.lastSeenGeneration != generation)
+            it = g_attemptedProcesses.erase(it);
+        else
+            ++it;
+    }
 }
 
 bool matchesWhitelistedPath(const WhitelistMatchSnapshot& whitelist, const std::wstring& fullPath)
@@ -423,7 +464,7 @@ bool matchesWhitelistedPath(const WhitelistMatchSnapshot& whitelist, const std::
     if (fullPath.empty())
         return false;
 
-    return whitelist.paths.find(normalizeWhitelistValue(fullPath)) != whitelist.paths.end();
+    return containsOrdinalIgnoreCase(whitelist.paths, fullPath);
 }
 
 struct ProcessMetadata
@@ -533,8 +574,13 @@ std::wstring lastErrorText(DWORD error)
     return text;
 }
 
-bool injectPayload(DWORD pid, ULONGLONG expectedCreationTime, const std::wstring& exeName)
+bool injectPayload(
+    DWORD pid,
+    ULONGLONG expectedCreationTime,
+    const std::wstring& exeName,
+    HANDLE& injectedProcess)
 {
+    injectedProcess = nullptr;
     if (GetFileAttributesW(g_payloadPath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, payload DLL missing");
@@ -542,7 +588,7 @@ bool injectPayload(DWORD pid, ULONGLONG expectedCreationTime, const std::wstring
     }
 
     HANDLE process = OpenProcess(
-        PROCESS_CREATE_THREAD | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE,
+        PROCESS_CREATE_THREAD | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | SYNCHRONIZE,
         FALSE,
         pid);
     if (!process)
@@ -649,7 +695,10 @@ bool injectPayload(DWORD pid, ULONGLONG expectedCreationTime, const std::wstring
     {
         // The remote thread may still be reading remotePath; leave it allocated rather than racing the target.
     }
-    CloseHandle(process);
+    if (ok)
+        injectedProcess = process;
+    else
+        CloseHandle(process);
 
     if (ok)
         appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - injected OK");
@@ -667,20 +716,55 @@ void watcherLoop()
 {
     WhitelistMatchSnapshot whitelist;
     std::uint64_t whitelistVersion = 0;
+    std::uint64_t scanGeneration = 0;
+    HANDLE activeProcess = nullptr;
+    DWORD activePid = 0;
 
     while (g_running.load(std::memory_order_relaxed))
     {
+        if (activeProcess)
+        {
+            DWORD waitResult = WAIT_TIMEOUT;
+            if (g_stopEvent)
+            {
+                const HANDLE handles[] = { g_stopEvent, activeProcess };
+                waitResult = WaitForMultipleObjects(static_cast<DWORD>(std::size(handles)), handles, FALSE, INFINITE);
+            }
+            else
+            {
+                waitResult = WaitForSingleObject(activeProcess, kWatcherScanIntervalMs);
+            }
+
+            if (waitResult == WAIT_OBJECT_0 && g_stopEvent)
+            {
+                CloseHandle(activeProcess);
+                activeProcess = nullptr;
+                break;
+            }
+
+            if (waitResult == WAIT_OBJECT_0 + (g_stopEvent ? 1 : 0))
+            {
+                CloseHandle(activeProcess);
+                activeProcess = nullptr;
+                g_attemptedProcesses.erase(activePid);
+                activePid = 0;
+            }
+            else if (waitResult == WAIT_FAILED)
+            {
+                CloseHandle(activeProcess);
+                activeProcess = nullptr;
+                activePid = 0;
+            }
+
+            continue;
+        }
+
         if (!g_paused.load(std::memory_order_relaxed))
         {
             refreshWhitelistMatchSnapshot(whitelist, whitelistVersion);
-            const bool shouldPruneAttemptedPids = hasAttemptedProcesses();
             const bool hasWhitelistEntries = !whitelist.names.empty() || whitelist.hasPathEntries;
-            if (hasWhitelistEntries || shouldPruneAttemptedPids)
+            if (hasWhitelistEntries || hasAttemptedProcesses())
             {
-                std::unordered_set<DWORD> missingAttemptedPids;
-                if (shouldPruneAttemptedPids)
-                    missingAttemptedPids = attemptedPidsSnapshot();
-
                 HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
                 if (snapshot != INVALID_HANDLE_VALUE)
                 {
@@ -688,19 +772,20 @@ void watcherLoop()
                     entry.dwSize = static_cast<DWORD>(sizeof(entry));
                     if (Process32FirstW(snapshot, &entry))
                     {
+                        ++scanGeneration;
+                        bool enumerationCompleted = true;
                         do
                         {
                             const DWORD pid = entry.th32ProcessID;
-                            if (shouldPruneAttemptedPids)
-                                missingAttemptedPids.erase(pid);
+                            markProcessSeen(pid, scanGeneration);
 
                             if (!hasWhitelistEntries)
                                 continue;
 
-                            const std::wstring exeLower = toLower(std::wstring(entry.szExeFile));
-                            const bool nameMatched = whitelist.names.find(exeLower) != whitelist.names.end();
+                            const std::wstring_view exeName(entry.szExeFile);
+                            const bool nameMatched = containsOrdinalIgnoreCase(whitelist.names, exeName);
                             const bool pathNameMatched = !nameMatched && whitelist.hasPathEntries &&
-                                whitelist.pathNames.find(exeLower) != whitelist.pathNames.end();
+                                containsOrdinalIgnoreCase(whitelist.pathNames, exeName);
                             if (!nameMatched && !pathNameMatched)
                                 continue;
 
@@ -712,9 +797,8 @@ void watcherLoop()
                             {
                                 if (nameMatched)
                                 {
-                                    const std::wstring exeName = entry.szExeFile;
-                                    markProcessAttempted(pid, kUnknownProcessCreationTime);
-                                    appendLog(exeName + L" (PID " + std::to_wstring(pid) + L") - failed, could not identify process instance");
+                                    markProcessAttempted(pid, kUnknownProcessCreationTime, scanGeneration);
+                                    appendLog(std::wstring(exeName) + L" (PID " + std::to_wstring(pid) + L") - failed, could not identify process instance");
                                 }
                                 continue;
                             }
@@ -725,18 +809,26 @@ void watcherLoop()
                             if (!nameMatched && !matchesWhitelistedPath(whitelist, metadata.fullPath))
                                 continue;
 
-                            const std::wstring exeName = entry.szExeFile;
-                            markProcessAttempted(pid, metadata.creationTime);
-                            injectPayload(pid, metadata.creationTime, exeName);
+                            markProcessAttempted(pid, metadata.creationTime, scanGeneration);
+                            if (injectPayload(pid, metadata.creationTime, std::wstring(exeName), activeProcess))
+                            {
+                                activePid = pid;
+                                enumerationCompleted = false;
+                                break;
+                            }
                         } while (Process32NextW(snapshot, &entry));
+
+                        if (enumerationCompleted)
+                            removeUnseenAttemptedProcesses(scanGeneration);
                     }
 
                     CloseHandle(snapshot);
-                    if (shouldPruneAttemptedPids)
-                        removeAttemptedProcesses(missingAttemptedPids);
                 }
             }
         }
+
+        if (activeProcess)
+            continue;
 
         if (g_stopEvent)
         {
@@ -748,6 +840,9 @@ void watcherLoop()
             Sleep(kWatcherScanIntervalMs);
         }
     }
+
+    if (activeProcess)
+        CloseHandle(activeProcess);
 }
 
 bool startWithWindowsEnabled()
