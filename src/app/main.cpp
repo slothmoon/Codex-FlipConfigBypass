@@ -749,25 +749,18 @@ void watcherLoop()
     {
         if (activeProcess)
         {
-            DWORD waitResult = WAIT_TIMEOUT;
-            if (g_stopEvent)
-            {
-                const HANDLE handles[] = { g_stopEvent, activeProcess };
-                waitResult = WaitForMultipleObjects(static_cast<DWORD>(std::size(handles)), handles, FALSE, INFINITE);
-            }
-            else
-            {
-                waitResult = WaitForSingleObject(activeProcess, kWatcherScanIntervalMs);
-            }
+            const HANDLE handles[] = { g_stopEvent, activeProcess };
+            const DWORD waitResult = WaitForMultipleObjects(
+                static_cast<DWORD>(std::size(handles)), handles, FALSE, INFINITE);
 
-            if (waitResult == WAIT_OBJECT_0 && g_stopEvent)
+            if (waitResult == WAIT_OBJECT_0)
             {
                 CloseHandle(activeProcess);
                 activeProcess = nullptr;
                 break;
             }
 
-            if (waitResult == WAIT_OBJECT_0 + (g_stopEvent ? 1 : 0))
+            if (waitResult == WAIT_OBJECT_0 + 1)
             {
                 CloseHandle(activeProcess);
                 activeProcess = nullptr;
@@ -859,15 +852,8 @@ void watcherLoop()
         if (activeProcess)
             continue;
 
-        if (g_stopEvent)
-        {
-            if (WaitForSingleObject(g_stopEvent, kWatcherScanIntervalMs) == WAIT_OBJECT_0)
-                break;
-        }
-        else
-        {
-            Sleep(kWatcherScanIntervalMs);
-        }
+        if (WaitForSingleObject(g_stopEvent, kWatcherScanIntervalMs) == WAIT_OBJECT_0)
+            break;
     }
 
     if (activeProcess)
@@ -1162,8 +1148,14 @@ void showEditor(HWND owner)
             DispatchMessageW(&msg);
         }
     }
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
+
+    if (messageResult <= 0 && IsWindow(hwnd))
+        DestroyWindow(hwnd);
+    if (IsWindow(owner))
+    {
+        EnableWindow(owner, TRUE);
+        SetForegroundWindow(owner);
+    }
     if (messageResult == 0)
         PostQuitMessage(0);
 }
@@ -1368,6 +1360,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     if (!acquireSingleInstance())
         return 0;
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_stopEvent)
+    {
+        MessageBoxW(nullptr,
+            L"Flip Config Bypass could not initialize its watcher synchronization event.",
+            L"Flip Config Bypass",
+            MB_ICONERROR | MB_OK);
+        releaseSingleInstance();
+        return 1;
+    }
 
     g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     initFonts();
