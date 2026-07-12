@@ -7,13 +7,18 @@ on:
       - main
       - master
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2025
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Build Release x64
         shell: cmd
@@ -41,7 +46,7 @@ jobs:
           if not exist bin\Release\FlipConfigPayload.dll exit /b 1
 
       - name: Upload build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FlipConfigBypass-x64
           path: |
