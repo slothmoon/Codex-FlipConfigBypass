@@ -414,6 +414,7 @@ void scanAndPatchImports(ModuleScanState& state)
     {
         g_realNvApiQueryInterface.store(nullptr, std::memory_order_release);
         g_nvapiModule.store(nullptr, std::memory_order_relaxed);
+        seedRealNvApiQueryInterface();
     }
 
     auto scannedIt = state.scannedModules.begin();

@@ -840,7 +840,7 @@ void watcherLoop()
                             }
                         } while (Process32NextW(snapshot, &entry));
 
-                        if (enumerationCompleted)
+                        if (enumerationCompleted && GetLastError() == ERROR_NO_MORE_FILES)
                             removeUnseenAttemptedProcesses(scanGeneration);
                     }
 
@@ -1225,6 +1225,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     switch (msg)
     {
     case kTrayMessage:
+        if (!IsWindowEnabled(hwnd))
+            return 0;
         if (lparam == WM_RBUTTONUP || lparam == WM_LBUTTONUP)
             showTrayMenu(hwnd);
         return 0;
