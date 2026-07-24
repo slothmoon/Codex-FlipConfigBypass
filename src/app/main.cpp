@@ -45,6 +45,7 @@ constexpr wchar_t kEditorClass[] = L"FlipConfigBypassEditor";
 constexpr wchar_t kRunValueName[] = L"FlipConfigBypass";
 constexpr wchar_t kInstanceMutexName[] = L"Local\\FlipConfigBypass.Instance";
 constexpr LONGLONG kMaxLogBytes = 2ll * 1024ll * 1024ll;
+constexpr LONGLONG kMaxWhitelistBytes = 1ll * 1024ll * 1024ll;
 constexpr DWORD kWatcherScanIntervalMs = 2000;
 
 HINSTANCE g_instance = nullptr;
@@ -197,10 +198,11 @@ std::string wideToUtf8(const std::wstring& text)
     return result;
 }
 
-std::wstring utf8ToWide(const std::string& text)
+bool utf8ToWide(const std::string& text, std::wstring& result)
 {
+    result.clear();
     if (text.empty())
-        return {};
+        return true;
 
     const char* data = text.data();
     int byteCount = static_cast<int>(text.size());
@@ -213,34 +215,65 @@ std::wstring utf8ToWide(const std::string& text)
         byteCount -= 3;
     }
 
-    const int size = MultiByteToWideChar(CP_UTF8, 0, data, byteCount, nullptr, 0);
-    if (size <= 0)
-        return {};
+    if (byteCount == 0)
+        return true;
 
-    std::wstring result(static_cast<size_t>(size), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, data, byteCount, result.data(), size);
-    return result;
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data, byteCount, nullptr, 0);
+    if (size <= 0)
+        return false;
+
+    result.resize(static_cast<size_t>(size));
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data, byteCount, result.data(), size) == size;
 }
 
-std::wstring readTextFile(const std::wstring& path)
+enum class TextFileReadResult
 {
+    Success,
+    OpenFailed,
+    TooLarge,
+    ReadFailed,
+    InvalidUtf8
+};
+
+TextFileReadResult readTextFile(
+    const std::wstring& path,
+    LONGLONG maxBytes,
+    std::wstring& text)
+{
+    text.clear();
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
-        return {};
+        return TextFileReadResult::OpenFailed;
 
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0)
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0)
     {
         CloseHandle(file);
-        return {};
+        return TextFileReadResult::ReadFailed;
+    }
+
+    if (size.QuadPart > maxBytes)
+    {
+        CloseHandle(file);
+        return TextFileReadResult::TooLarge;
+    }
+
+    if (size.QuadPart == 0)
+    {
+        CloseHandle(file);
+        return TextFileReadResult::Success;
     }
 
     std::string bytes(static_cast<size_t>(size.QuadPart), '\0');
     DWORD read = 0;
-    ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
-    bytes.resize(read);
+    const BOOL readOk = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
     CloseHandle(file);
-    return utf8ToWide(bytes);
+    if (!readOk || static_cast<size_t>(read) != bytes.size())
+        return TextFileReadResult::ReadFailed;
+
+    return utf8ToWide(bytes, text)
+        ? TextFileReadResult::Success
+        : TextFileReadResult::InvalidUtf8;
 }
 
 bool writeTextFile(const std::wstring& path, const std::wstring& text)
@@ -293,11 +326,12 @@ void trimLogIfTooLarge()
         writeTextFile(g_logPath, L"");
 }
 
-void ensureDefaultFiles()
+bool ensureDefaultFiles()
 {
+    bool whitelistReady = true;
     if (GetFileAttributesW(g_whitelistPath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
-        writeTextFile(g_whitelistPath,
+        whitelistReady = writeTextFile(g_whitelistPath,
             L"# One executable name or full path per line.\r\n"
             L"# Example:\r\n"
             L"# GTA5.exe\r\n");
@@ -305,15 +339,48 @@ void ensureDefaultFiles()
 
     if (GetFileAttributesW(g_logPath.c_str()) == INVALID_FILE_ATTRIBUTES)
         writeTextFile(g_logPath, L"");
+
+    return whitelistReady;
 }
 
-void loadWhitelist()
+void showWhitelistReadError(TextFileReadResult result)
+{
+    std::wstring message;
+    switch (result)
+    {
+    case TextFileReadResult::OpenFailed:
+        message = L"Could not open whitelist.txt for reading.";
+        break;
+    case TextFileReadResult::TooLarge:
+        message = L"whitelist.txt exceeds the 1 MiB size limit.";
+        break;
+    case TextFileReadResult::ReadFailed:
+        message = L"Could not completely read whitelist.txt.";
+        break;
+    case TextFileReadResult::InvalidUtf8:
+        message = L"whitelist.txt is not valid UTF-8 text.";
+        break;
+    case TextFileReadResult::Success:
+        return;
+    }
+
+    message += L"\r\n\r\n";
+    message += g_whitelistPath;
+    MessageBoxW(nullptr, message.c_str(), L"Flip Config Bypass", MB_ICONERROR | MB_OK);
+}
+
+TextFileReadResult loadWhitelist()
 {
     std::vector<std::wstring> entries;
     std::vector<std::wstring> names;
     std::vector<std::wstring> paths;
     std::vector<std::wstring> pathNames;
-    std::wstring content = readTextFile(g_whitelistPath);
+    std::wstring content;
+    const TextFileReadResult readResult =
+        readTextFile(g_whitelistPath, kMaxWhitelistBytes, content);
+    if (readResult != TextFileReadResult::Success)
+        return readResult;
+
     size_t start = 0;
     while (start <= content.size())
     {
@@ -368,6 +435,7 @@ void loadWhitelist()
     g_whitelistPathNames = std::move(pathNames);
     g_hasPathWhitelist = !g_whitelistPaths.empty();
     g_whitelistVersion.fetch_add(1, std::memory_order_release);
+    return TextFileReadResult::Success;
 }
 
 std::vector<std::wstring> whitelistSnapshot()
@@ -970,11 +1038,13 @@ bool saveWhitelistList(HWND list)
     if (!content.empty())
         content += L"\r\n";
 
+    if (wideToUtf8(content).size() > static_cast<size_t>(kMaxWhitelistBytes))
+        return false;
+
     if (!writeTextFile(g_whitelistPath, content))
         return false;
 
-    loadWhitelist();
-    return true;
+    return loadWhitelist() == TextFileReadResult::Success;
 }
 
 bool listContainsNormalizedEntry(HWND list, const std::wstring& entry)
@@ -1089,7 +1159,11 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
             }
             else
             {
-                MessageBoxW(hwnd, L"Could not save whitelist.txt.", L"Flip Config Bypass", MB_ICONERROR | MB_OK);
+                MessageBoxW(hwnd,
+                    L"Could not save whitelist.txt.\r\n\r\n"
+                    L"The file must be valid UTF-8, no larger than 1 MiB, and stored in a writable folder.",
+                    L"Flip Config Bypass",
+                    MB_ICONERROR | MB_OK);
             }
         }
         else if (LOWORD(wparam) == kIdCancel)
@@ -1372,6 +1446,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         return 1;
     }
 
+    if (!ensureDefaultFiles())
+    {
+        MessageBoxW(nullptr,
+            L"Could not create whitelist.txt beside the launcher.\r\n\r\n"
+            L"Move the program to a writable folder or correct the folder permissions.",
+            L"Flip Config Bypass",
+            MB_ICONERROR | MB_OK);
+        closeStopEvent();
+        releaseSingleInstance();
+        return 1;
+    }
+
+    trimLogIfTooLarge();
+    const TextFileReadResult whitelistResult = loadWhitelist();
+    if (whitelistResult != TextFileReadResult::Success)
+    {
+        showWhitelistReadError(whitelistResult);
+        closeStopEvent();
+        releaseSingleInstance();
+        return 1;
+    }
+
     g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     initFonts();
     g_windowBrush = CreateSolidBrush(g_windowColor);
@@ -1380,9 +1476,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     g_ownsAppIcon = g_appIcon != nullptr;
     if (!g_appIcon)
         g_appIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    ensureDefaultFiles();
-    trimLogIfTooLarge();
-    loadWhitelist();
 
     if (!registerClasses())
     {

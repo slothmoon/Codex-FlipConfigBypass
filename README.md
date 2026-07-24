@@ -68,6 +68,8 @@ Matching is case-insensitive. Forward slashes in full paths are normalized to ba
 
 Use executable names for normal setups. Use a full path only when two installations share the same executable name and only one should be targeted.
 
+`whitelist.txt` must be UTF-8 text and is limited to 1 MiB, enough for tens of thousands of typical executable names.
+
 Changes made in the whitelist editor take effect without restarting the app.
 
 ## Tray Controls and Status
