@@ -444,6 +444,12 @@ std::vector<std::wstring> whitelistSnapshot()
     return g_whitelist;
 }
 
+size_t whitelistCount()
+{
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    return g_whitelist.size();
+}
+
 std::wstring activeProcessNameSnapshot()
 {
     std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -967,7 +973,7 @@ void setStartWithWindows(bool enabled)
 
 void updateTrayTip()
 {
-    const size_t watched = whitelistSnapshot().size();
+    const size_t watched = whitelistCount();
     const std::wstring activeProcessName = activeProcessNameSnapshot();
     std::wstring tip = L"Flip Config Bypass\r\n";
     if (!activeProcessName.empty())
@@ -1247,7 +1253,7 @@ void showTrayMenu(HWND hwnd)
     POINT point{};
     GetCursorPos(&point);
     HMENU menu = CreatePopupMenu();
-    const size_t watched = whitelistSnapshot().size();
+    const size_t watched = whitelistCount();
     const bool paused = g_paused.load(std::memory_order_relaxed);
     const bool gameActive = activeProcessRunning();
     const std::wstring status = gameActive
